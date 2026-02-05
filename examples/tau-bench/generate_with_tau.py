@@ -33,8 +33,8 @@ TAU_CONFIGS = {
 # Replace with your actual API key for user sim
 # GEMINI_API_KEY = "NONE"
 # os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
-OPENAI_API_KEY = ""
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+# OPENAI_API_KEY = ""
+# os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 tau_config = RunConfig(**TAU_CONFIGS)
 
 
