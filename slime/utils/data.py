@@ -200,7 +200,9 @@ class Dataset:
             as_conversation = apply_chat_template or (multimodal_keys is not None)
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
 
-            metadata = data.get(metadata_key) or {}
+            metadata = dict(data.get(metadata_key) or {})
+            if "data_source" in data:
+                metadata["data_source"] = data["data_source"]
             tools = None
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]

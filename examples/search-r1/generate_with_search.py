@@ -21,7 +21,8 @@ SEARCH_R1_CONFIGS = {
     # ============== Local Search Configuration ==============
     # (Only used when search_backend="local")
     "local": {
-        "search_url": "http://127.0.0.1:8000/retrieve",  # URL of your local retrieval server
+        # "search_url": "http://127.0.0.1:8000/retrieve",  # URL of your local retrieval server
+        "search_url": "http://131.179.168.118:8000/retrieve",  # URL of your local retrieval server
         "proxy": None,  # Set to your proxy if needed
     },
     # ============== Google Search Configuration ==============

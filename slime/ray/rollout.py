@@ -869,6 +869,16 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            # Log per data_source when samples have metadata["data_source"] (e.g. mixed test.parquet)
+            data_source_rewards = {}
+            for sample, reward in zip(samples, rewards):
+                ds = (getattr(sample, "metadata", None) or {}).get("data_source", None)
+                if ds is not None:
+                    if ds not in data_source_rewards:
+                        data_source_rewards[ds] = []
+                    data_source_rewards[ds].append(reward)
+            for ds, ds_rewards in data_source_rewards.items():
+                log_dict[f"eval/{ds}"] = sum(ds_rewards) / len(ds_rewards)
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)

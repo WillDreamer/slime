@@ -15,16 +15,12 @@ set -ex
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
 
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-if [ "$NVLINK_COUNT" -gt 0 ]; then
-    HAS_NVLINK=1
-else
-    HAS_NVLINK=0
-fi
-echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
-
 ROOT_DIR=/data1/whx
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+echo "SCRIPT_DIR=${SCRIPT_DIR}"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-4B.sh"
 WANDB_API_KEY="ba70fcbc92808cc7a1750dd80ac3908295e6854f"
+
 
 GPU_LIST=(4 5 6 7)  # <<<------  which GPUs to use, directly fill here
 CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
@@ -34,38 +30,36 @@ echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS=${#GPU_LIST[@]}
 echo "Detected ${NUM_GPUS} GPUs for this run"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-echo "SCRIPT_DIR=${SCRIPT_DIR}"
-source "${SCRIPT_DIR}/../../scripts/models/qwen3-4B.sh"
-
 CKPT_ARGS=(
-   --hf-checkpoint /data2/whx/Qwen3-4B/
+   --hf-checkpoint /data2/whx/Qwen3-4B-FP8/
    --ref-load /data2/whx/Qwen3-4B_torch_dist/
-   --load /data2/whx/Qwen3-4B_tau/
-   --save /data2/whx/Qwen3-4B_tau/
-   --save-interval 20
+   --load /data2/whx/Qwen3-4B_search/
+   --save /data2/whx/Qwen3-4B_search/
+   --save-interval 500
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /data1/whx/tau-bench/retail_train_tasks.jsonl
-   --input-key index
+   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
+   --input-key prompt
+   --label-key reward_model
+   --apply-chat-template
    --rollout-shuffle
-   --num-rollout 500
-   --rollout-batch-size 32
+   --num-rollout 3000
+   --rollout-batch-size 4
    --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
+   --rollout-max-response-len 2048
    --rollout-temperature 1
-   --global-batch-size 256
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-   --balance-data
-)
 
-EVAL_ARGS=(
-   --eval-interval 5
-   --eval-prompt-data retail-dev /data1/whx/tau-bench/retail_dev_tasks.jsonl
+   # eval args
+   --eval-interval 25
+   # --eval-prompt-data nq_test ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
+   --eval-prompt-data nq_test /data1/whx/ARLArena/datasets/data/searchR1_processed_direct/test.parquet
+   --eval-input-key prompt
+   --eval-label-key reward_model
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 1024
-   --eval-top-k 1
+
+   --global-batch-size 32
+   --balance-data
 )
 
 PERF_ARGS=(
@@ -75,9 +69,12 @@ PERF_ARGS=(
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
+
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
+
+   # --micro-batch-size 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 )
@@ -85,11 +82,12 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.00
+   --kl-loss-coef 0.001
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+
    # whether enabling TIS
    --use-tis
 )
@@ -98,7 +96,7 @@ OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
    --lr-decay-style constant
-   --weight-decay 0.1
+   --weight-decay 0.01
    --adam-beta1 0.9
    --adam-beta2 0.98
 )
@@ -106,15 +104,13 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group tau-bench_qwen3-4B
+   --wandb-group search-r1_qwen3-4B-FP8
    --wandb-key ${WANDB_API_KEY}
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.8
-   # If gemini API reports concurrency limit error, set this parameter to reduce the concurrency
-   # --sglang-server-concurrency 32
 )
 
 MISC_ARGS=(
@@ -129,28 +125,31 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_tau.generate
+   --custom-generate-function-path generate_with_search.generate
+   --custom-rm-path generate_with_search.reward_func
 
    # TIS-related args, recommended to enable when using TIS
    --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
    --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
 
+# launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${PYTHONPATH}"
 export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${SCRIPT_DIR}:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-
-# If you want more or less GPUs, change this parameter
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir /data2/whx/ray_temp 
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --temp-dir /data2/whx/ray_temp 
 
 # RUNTIME_ENV_JSON="{
 #   \"env_vars\": {
-#     \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
+#     \"PYTHONPATH\": \"${ROOT_DIR}/Megatron-LM/:${SCRIPT_DIR}\",
 #     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
 #   }
 # }"
 
+# ray job submit --address="http://127.0.0.1:8265" \
+#    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+#    -- python3 train.py \
 python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node ${NUM_GPUS} \
@@ -161,10 +160,8 @@ python3 train.py \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
-   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${CUSTOM_ARGS[@]}
