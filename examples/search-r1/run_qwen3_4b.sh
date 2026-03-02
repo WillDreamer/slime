@@ -19,7 +19,7 @@ ROOT_DIR=/data1/whx
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-4B.sh"
-WANDB_API_KEY="ba70fcbc92808cc7a1750dd80ac3908295e6854f"
+WANDB_API_KEY="${WANDB_API_KEY}"
 
 
 GPU_LIST=(4 5 6 7)  # <<<------  which GPUs to use, directly fill here

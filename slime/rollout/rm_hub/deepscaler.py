@@ -7,7 +7,8 @@ def get_deepscaler_rule_based_reward(response, label):
     elif "###Response" in response:
         model_solution = response.split("###Response")[1]
     else:
-        return 0
+        # 无 think/response 标记时用整段 response 抽 \boxed{...}（如 "Answer: \\boxed{256}"）
+        model_solution = response
 
     model_answer = extract_answer(model_solution)
     if model_answer is None:

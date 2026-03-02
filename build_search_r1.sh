@@ -41,11 +41,11 @@ export PYTHONPATH="$ROOT_DIR/slime:$ROOT_DIR/Megatron-LM:${PYTHONPATH}"
 #   --hf-checkpoint /data2/whx/Qwen3-4B \
 #   --save /data2/whx/Qwen3-4B_torch_dist
 echo "${MODEL_ARGS[@]}"
-# torchrun --nproc-per-node 4 \
-#    tools/convert_hf_to_torch_dist.py \
-#    ${MODEL_ARGS[@]} \
-#    --hf-checkpoint /data2/whx/Qwen3-30B-A3B/ \
-#    --save /data2/whx/Qwen3-30B-A3B_torch_dist/
+torchrun --nproc-per-node 4 \
+   tools/convert_hf_to_torch_dist.py \
+   ${MODEL_ARGS[@]} \
+   --hf-checkpoint /data2/whx/Qwen/Qwen3-30B-A3B-Base \
+   --save /data2/whx/Qwen3-30B-A3B_base_torch_dist/
 
 
 ## 3.
