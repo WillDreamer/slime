@@ -13,7 +13,7 @@ from slime.utils.types import Sample
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 2,
+    "max_turns": 5,
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
@@ -21,7 +21,8 @@ SEARCH_R1_CONFIGS = {
     # ============== Local Search Configuration ==============
     # (Only used when search_backend="local")
     "local": {
-        "search_url": "http://127.0.0.1:8000/retrieve",  # URL of your local retrieval server
+        # "search_url": "http://127.0.0.1:8000/retrieve",  # URL of your local retrieval server
+        "search_url": "http://131.179.168.118:8000/retrieve",  # URL of your local retrieval server
         "proxy": None,  # Set to your proxy if needed
     },
     # ============== Google Search Configuration ==============

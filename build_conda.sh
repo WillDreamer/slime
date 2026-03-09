@@ -5,9 +5,15 @@ set -ex
 # create conda
 yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
 export PS1=tmp
-mkdir -p /root/.cargo/
-touch /root/.cargo/env
+ROOT_DIR=/data1/whx
+mkdir -p $ROOT_DIR/.cargo/
+touch $ROOT_DIR/.cargo/env
 source ~/.bashrc
+
+# Explicitly init micromamba in script (source .bashrc may return early in non-interactive shell)
+export MAMBA_EXE="${MAMBA_EXE:-$ROOT_DIR/.local/bin/micromamba}"
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$ROOT_DIR/micromamba}"
+eval "$("$MAMBA_EXE" shell hook --shell bash --root-prefix "$MAMBA_ROOT_PREFIX")"
 
 micromamba create -n slime python=3.12 pip -c conda-forge -y
 micromamba activate slime
@@ -15,7 +21,7 @@ export CUDA_HOME="$CONDA_PREFIX"
 export SGLANG_COMMIT="24c91001cf99ba642be791e099d358f4dfe955f5"
 export MEGATRON_COMMIT="3714d81d418c9f1bca4594fc35f9e8289f652862"
 
-export BASE_DIR=${BASE_DIR:-"/root"}
+export BASE_DIR=${BASE_DIR:-$ROOT_DIR}
 cd $BASE_DIR
 
 # install cuda 12.9 as it's the default cuda version for torch
@@ -26,9 +32,11 @@ micromamba install -n slime -c conda-forge cudnn -y
 pip install cuda-python==13.1.0
 pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu129
 
-# install sglang
-git clone https://github.com/sgl-project/sglang.git
-cd sglang
+# install sglang, but only clone if not already existing
+if [ ! -d "$BASE_DIR/sglang" ]; then
+  git clone https://github.com/sgl-project/sglang.git
+fi
+cd $BASE_DIR/sglang
 git checkout ${SGLANG_COMMIT}
 # Install the python packages
 pip install -e "python[all]"
@@ -54,9 +62,16 @@ pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation
 
 # megatron
 cd $BASE_DIR
-git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
-  cd Megatron-LM/ && git checkout ${MEGATRON_COMMIT} && \
+if [ ! -d "$BASE_DIR/Megatron-LM" ]; then
+  git clone https://github.com/NVIDIA/Megatron-LM.git --recursive
+  cd Megatron-LM
+  git checkout ${MEGATRON_COMMIT}
   pip install -e .
+else
+  cd Megatron-LM
+  git checkout ${MEGATRON_COMMIT}
+  pip install -e .
+fi
 
 # install slime and apply patches
 
@@ -64,17 +79,21 @@ git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
 if [ ! -d "$BASE_DIR/slime" ]; then
   cd $BASE_DIR
   git clone  https://github.com/THUDM/slime.git
-  cd slime/
   export SLIME_DIR=$BASE_DIR/slime
+  cd "$SLIME_DIR"
   pip install -e .
 else
-  export SLIME_DIR=$BASE_DIR/
+  export SLIME_DIR=$BASE_DIR/slime
+  cd "$SLIME_DIR"
   pip install -e .
 fi
 
 # https://github.com/pytorch/pytorch/issues/168167
 pip install nvidia-cudnn-cu12==9.16.0.29
+# pip install -r $SLIME_DIR/requirements.txt
 pip install "numpy<2"
+# python -m pip install --no-build-isolation --force-reinstall "transformer-engine[torch]>=1.4.0"
+
 
 # apply patch
 cd $BASE_DIR/sglang
