@@ -13,7 +13,7 @@ from slime.utils.types import Sample
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 2,
+    "max_turns": 5,
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
