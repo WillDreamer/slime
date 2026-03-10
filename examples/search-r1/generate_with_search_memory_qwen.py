@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 5,
+    "max_turns": 4,
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
