@@ -356,6 +356,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_text: str = sample.prompt
     if OLD_INSTRUCTION_SUBSTRING in prompt_text:
         prompt_text = prompt_text.replace(OLD_INSTRUCTION_SUBSTRING, NEW_INSTRUCTION)
+    elif "<tool_call>" not in prompt_text and "<search>" not in prompt_text:
+        # Eval data has no search instructions at all.
+        # Inject NEW_INSTRUCTION before the last user message boundary so the
+        # model knows how to use search tools.
+        user_tag = "<|im_start|>user\n"
+        last_user_pos = prompt_text.rfind(user_tag)
+        if last_user_pos != -1:
+            insert_pos = last_user_pos + len(user_tag)
+            prompt_text = (
+                prompt_text[:insert_pos]
+                + NEW_INSTRUCTION
+                + "\n\n"
+                + prompt_text[insert_pos:]
+            )
 
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)[
         "input_ids"

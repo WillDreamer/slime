@@ -55,120 +55,146 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args = args
             return 0
 
-        monkey_patch_torch_dist()
-        super().init(args, role, with_ref, with_opd_teacher)
+        import traceback as _tb
+        import sys as _sys
 
-        init(args)
+        def _log(msg):
+            logger.warning(f"[RANK {self._rank}] {msg}")
+            _sys.stderr.write(f"[RANK {self._rank}] {msg}\n")
+            _sys.stderr.flush()
 
-        if is_megatron_main_rank():
-            init_tracking(args, primary=False)
+        try:
+            _log("init() starting")
+            monkey_patch_torch_dist()
+            super().init(args, role, with_ref, with_opd_teacher)
+            _log("super().init() done")
 
-        self.prof = TrainProfiler(args)
+            init(args)
+            _log("megatron init() done")
 
-        # read config and tokenizer serialized to prevent concurrent writing bug.
-        for i in range(args.num_gpus_per_node):
-            if i == dist.get_rank() % args.num_gpus_per_node:
-                self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-                self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+            if is_megatron_main_rank():
+                init_tracking(args, primary=False)
+
+            self.prof = TrainProfiler(args)
+
+            for i in range(args.num_gpus_per_node):
+                if i == dist.get_rank() % args.num_gpus_per_node:
+                    self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+                dist.barrier(group=get_gloo_group())
+
+            self.train_parallel_config = {
+                "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+            }
             dist.barrier(group=get_gloo_group())
 
-        self.train_parallel_config = {
-            "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
-        }
-        dist.barrier(group=get_gloo_group())
+            if args.offload_train:
+                if (x := args.train_memory_margin_bytes) > 0:
+                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
+                    torch_memory_saver.memory_margin_bytes = x
 
-        if args.offload_train:
-            if (x := args.train_memory_margin_bytes) > 0:
-                logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-                torch_memory_saver.memory_margin_bytes = x
+            if role == "critic":
+                self.args.load = self.args.critic_load
+                self.args.save = self.args.critic_save
+                self.args.lr = self.args.critic_lr
+                self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
 
-        if role == "critic":
-            self.args.load = self.args.critic_load
-            self.args.save = self.args.critic_save
-            self.args.lr = self.args.critic_lr
-            self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
+            _log("loading model and optimizer...")
+            (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
+                args, role
+            )
+            _log(f"model loaded, loaded_rollout_id={loaded_rollout_id}")
 
-        (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
-            args, role
-        )
+            start_rollout_id = loaded_rollout_id + 1
 
-        start_rollout_id = loaded_rollout_id + 1
+            if role == "critic":
+                if self.args.offload_train:
+                    self.sleep()
+                return start_rollout_id
 
-        if role == "critic":
-            if self.args.offload_train:
-                self.sleep()
-            return start_rollout_id
+            _log("setting up weights_backuper...")
+            self.weights_backuper = TensorBackuper.create(
+                source_getter=lambda: named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=args.megatron_to_hf_mode == "raw",
+                    translate_gpu_to_cpu=not self.args.enable_weights_backuper,
+                ),
+                single_tag=None if args.enable_weights_backuper else "actor",
+            )
+            self._active_model_tag: str | None = "actor"
+            self.weights_backuper.backup("actor")
+            _log("weights backup done")
 
-        self.weights_backuper = TensorBackuper.create(
-            source_getter=lambda: named_params_and_buffers(
+            if with_ref:
+                _log("loading ref model...")
+                self.load_other_checkpoint("ref", args.ref_load)
+                _log("ref model loaded")
+
+            if with_opd_teacher:
+                self.load_other_checkpoint("teacher", args.opd_teacher_load)
+
+            if self.args.keep_old_actor:
+                self.load_other_checkpoint("old_actor", args.load)
+                if args.update_weights_interval == 1:
+                    self.weights_backuper.backup("rollout_actor")
+
+            if self.args.vocab_size is None:
+                hf_vocab = getattr(self.hf_config, "vocab_size", None)
+                self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
+
+            _log("setting up weight_updater...")
+            update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+            self.weight_updater = update_weight_cls(
                 self.args,
                 self.model,
-                convert_to_global_name=args.megatron_to_hf_mode == "raw",
-                translate_gpu_to_cpu=not self.args.enable_weights_backuper,
-            ),
-            single_tag=None if args.enable_weights_backuper else "actor",
-        )
-        self._active_model_tag: str | None = "actor"
-        self.weights_backuper.backup("actor")
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
+                quantization_config=getattr(self.hf_config, "quantization_config", None),
+            )
+            _log("weight_updater done")
 
-        if with_ref:
-            self.load_other_checkpoint("ref", args.ref_load)
+            clear_memory()
 
-        # Load teacher model for Megatron-based on-policy distillation
-        if with_opd_teacher:
-            self.load_other_checkpoint("teacher", args.opd_teacher_load)
+            if self.args.offload_train:
+                _log("offloading train model...")
+                self._switch_model("actor")
+                self.sleep()
+                _log("offload done")
 
-        if self.args.keep_old_actor:
-            # Load old_actor checkpoint
-            self.load_other_checkpoint("old_actor", args.load)
-            # Create rollout_actor as a copy of current actor
-            if args.update_weights_interval == 1:
-                self.weights_backuper.backup("rollout_actor")
+            self.rollout_engines = None
 
-        if self.args.vocab_size is None:
-            # Prefer HF config vocab_size (which may include model-native padding)
-            # over tokenizer vocab_size (which may be smaller, e.g. GPT-OSS).
-            hf_vocab = getattr(self.hf_config, "vocab_size", None)
-            self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
+            self.rollout_data_postprocess = None
+            if self.args.rollout_data_postprocess_path is not None:
+                from slime.utils.misc import load_function
+                self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-        self.weight_updater = update_weight_cls(
-            self.args,
-            self.model,
-            weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
-            quantization_config=getattr(self.hf_config, "quantization_config", None),
-        )
+            self.prof.on_init_end()
 
-        # empty cache after initialization
-        clear_memory()
+            _log(f"init() completed, returning start_rollout_id={start_rollout_id}")
+            return start_rollout_id
 
-        if self.args.offload_train:
-            # recover to actor in the end.
-            self._switch_model("actor")
-            self.sleep()
-
-        self.rollout_engines = None
-
-        self.rollout_data_postprocess = None
-        if self.args.rollout_data_postprocess_path is not None:
-            from slime.utils.misc import load_function
-
-            self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
-
-        self.prof.on_init_end()
-
-        return start_rollout_id
+        except Exception as _e:
+            _log(f"CRASH: {_e}\n{_tb.format_exc()}")
+            raise
 
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        import sys as _sys
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
+
+        _sys.stderr.write(f"[RANK {self._rank}] sleep: calling destroy_process_groups...\n")
+        _sys.stderr.flush()
         destroy_process_groups()
+        _sys.stderr.write(f"[RANK {self._rank}] sleep: destroy_process_groups done, calling torch_memory_saver.pause...\n")
+        _sys.stderr.flush()
 
         torch_memory_saver.pause()
+        _sys.stderr.write(f"[RANK {self._rank}] sleep: torch_memory_saver.pause done\n")
+        _sys.stderr.flush()
 
         print_memory("after offload model")
 

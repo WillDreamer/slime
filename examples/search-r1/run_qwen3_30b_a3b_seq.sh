@@ -6,7 +6,7 @@ sleep 3
 ray stop --force
 pkill -9 ray
 pkill -9 python
-# sleep 3
+sleep 3
 # pkill -9 ray
 # pkill -9 python
 
@@ -29,9 +29,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
-ROLLOUT_BATCH_SIZE=16
-GLOBAL_BATCH_SIZE=128
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen"
+ROLLOUT_BATCH_SIZE=8
+GLOBAL_BATCH_SIZE=64
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_resume"
 
 ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/${WANDB_GROUP}"
 
@@ -47,11 +47,18 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
    --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
-   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
+   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_search/
    --save ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_search/
-   --save-interval 100
-   --finetune
+   --save-interval 20
+   --save-retain-interval 60
+   # --finetune
+   # --start-rollout-id 0
+   # --skip-eval-before-train False
 )
+
+# --finetune 的效果（参见 Megatron 的 checkpointing.py 第 1711 行）：
+# 只加载模型权重，跳过 optimizer 和 lr scheduler 的状态恢复
+# iteration 从 0 重新开始，不会接着 math 的 iteration 继续计数
 
 ROLLOUT_ARGS=(
    --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
@@ -59,7 +66,7 @@ ROLLOUT_ARGS=(
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 1000
+   --num-rollout 3000
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
@@ -68,7 +75,7 @@ ROLLOUT_ARGS=(
    # eval args
    --eval-interval 25
    # --eval-prompt-data nq_test ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
-   --eval-prompt-data nq_test /data1/whx/ARLArena/datasets/data/searchR1_processed_direct/test.parquet
+   --eval-prompt-data nq_test /data1/whx/ARLArena/datasets/data/searchR1_processed_direct/test_small.parquet
    --eval-input-key prompt
    --eval-label-key reward_model
    --n-samples-per-eval-prompt 1
@@ -131,7 +138,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    # MoE related args
    --rollout-num-gpus-per-engine ${NUM_GPUS}
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.65
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    # --sglang-enable-dp-attention
@@ -147,6 +154,8 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
+
+   --distributed-timeout-minutes 60 
 )
 
 CUSTOM_ARGS=(
@@ -165,6 +174,7 @@ export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${SCRIPT_DIR}:${PYT
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE="${HAS_NVLINK}"
 export RAY_memory_usage_threshold=0.99
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=false
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
 
@@ -180,11 +190,15 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disab
 # ray job submit --address="http://127.0.0.1:8265" \
 #    --runtime-env-json="${RUNTIME_ENV_JSON}" \
 #    -- python3 train.py \
+
+export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
 python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node ${NUM_GPUS} \
    --num-gpus-per-node ${NUM_GPUS} \
    --colocate \
+   --no-offload-train \
+   --no-offload-rollout \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
