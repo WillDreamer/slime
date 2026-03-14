@@ -67,6 +67,7 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --num-rollout 3000
+   # --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
@@ -138,7 +139,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    # MoE related args
    --rollout-num-gpus-per-engine ${NUM_GPUS}
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.65
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    # --sglang-enable-dp-attention
