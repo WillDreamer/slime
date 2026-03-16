@@ -3,7 +3,7 @@ import json
 import logging
 import re
 
-from qa_em_format_qwen import compute_score_em  # type: ignore
+from qa_em_format_qwen import compute_score_em, is_valid_sequence, em_check, extract_solution  # type: ignore
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 4,
+    "max_turns": 5,
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
@@ -434,6 +434,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     )
 
     stats = manager.get_stats()
+    sample.metadata["num_turns"] = stats["num_turns"]
     logger.debug(
         f"ContextWindow stats: turns={stats['num_turns']}, "
         f"obs_full={stats['obs_full']}, obs_compressed={stats['obs_compressed']}"
@@ -464,7 +465,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 # 答对 + 格式正确	1.0	满分
-# 答对 + 格式不对	0.8	score - structure_format_score = 1.0 - 0.2
+# 答对 + 格式不对	0.4	0.6*score - structure_format_score = 0.5 - 0.2
 # 答错 + 格式正确 + 检索到答案	0.3	structure_format_score + retrieval_score = 0.2 + 0.1
 # 答错 + 格式正确 + 没检索到	0.2	structure_format_score = 0.2
 # 答错 + 格式不对	-0.1	final_format_score = -0.1
@@ -474,13 +475,26 @@ async def reward_func(args, sample, **kwargs):
         raise TypeError("Sample must be an instance of Sample class.")
 
     fmt = SEARCH_R1_CONFIGS["format_score"]
+    solution_str = sample.prompt + sample.response
     score = compute_score_em(
-        solution_str=sample.prompt + sample.response,
+        solution_str=solution_str,
         ground_truth=sample.label["ground_truth"],
         structure_format_score=fmt,
         final_format_score=-0.1,
         retrieval_score=fmt * 0.5,
     )
+
+    # Track tool calling and format metrics for wandb
+    is_valid, _ = is_valid_sequence(solution_str)
+    has_tool_call = "<tool_call>" in sample.response
+    answer = extract_solution(solution_str)
+    answer_correct = bool(answer and em_check(answer, sample.label["ground_truth"]["target"]))
+
+    if sample.metadata is None:
+        sample.metadata = {}
+    sample.metadata["valid_format"] = int(is_valid)
+    sample.metadata["has_tool_call"] = int(has_tool_call)
+    sample.metadata["answer_correct"] = int(answer_correct)
 
     return score
 

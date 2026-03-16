@@ -47,12 +47,12 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
    --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
-   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
+   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_search_strict_v1/
    --save ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_search_strict_v1/
    --save-interval 20
    --save-retain-interval 60
-   --finetune
-   --start-rollout-id 0
+   # --finetune
+   # --start-rollout-id 0
    # --skip-eval-before-train False
 )
 

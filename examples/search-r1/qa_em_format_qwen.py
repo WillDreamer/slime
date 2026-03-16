@@ -183,13 +183,13 @@ def compute_score_em(
             else:
                 return structure_format_score  # 0.2
         else:
-            return 0
+            return -0.1
     else:
         if em_check(answer, ground_truth["target"]):
             if is_valid_format:
                 return score  # 1
             else:
-                return score - structure_format_score  # 0.8
+                return 0.6 * score - structure_format_score  # 0.2
         elif is_valid_format:
             if retrieval_correct:
                 return structure_format_score + retrieval_score  # 0.3

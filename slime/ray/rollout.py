@@ -1155,6 +1155,25 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
+
+    # Log multi-turn interaction statistics if available
+    turn_counts = [s.metadata.get("num_turns") for s in samples if s.metadata.get("num_turns") is not None]
+    if turn_counts:
+        log_dict |= dict_add_prefix(compute_statistics(turn_counts), "num_turns/")
+
+    # Log tool calling and format metrics if available
+    valid_formats = [s.metadata.get("valid_format") for s in samples if s.metadata.get("valid_format") is not None]
+    if valid_formats:
+        log_dict["valid_format_rate"] = np.mean(valid_formats).item()
+
+    tool_calls = [s.metadata.get("has_tool_call") for s in samples if s.metadata.get("has_tool_call") is not None]
+    if tool_calls:
+        log_dict["tool_call_rate"] = np.mean(tool_calls).item()
+
+    answer_corrects = [s.metadata.get("answer_correct") for s in samples if s.metadata.get("answer_correct") is not None]
+    if answer_corrects:
+        log_dict["answer_correct_rate"] = np.mean(answer_corrects).item()
+
     return log_dict
 
 

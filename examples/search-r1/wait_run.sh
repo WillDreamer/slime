@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # List the PIDs you want to wait for
-PIDS=(174224 174225)
+PIDS=(3089419  3086402)
 
 echo "Waiting for PIDs to terminate: ${PIDS[@]}"
 
@@ -31,4 +31,4 @@ done
 # echo "Starting next job..."
 # bash /data1/xw27/agent/ARLArena/examples/math_trainer/train_grpo_s_cispo.sh
 
-bash /data1/whx/slime/examples/search-r1/run_qwen3_30b_a3b_seq.sh
+bash /data1/whx/slime/examples/search-r1/run_qwen3_30b_a3b_seq_resume.sh
