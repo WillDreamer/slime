@@ -31,9 +31,11 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
 ROLLOUT_BATCH_SIZE=64
 GLOBAL_BATCH_SIZE=320
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_gspo_cold_then_mask_resume"
 
-ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/${WANDB_GROUP}"
+## v3 加大kl 0.1,答对但没有toolcall降到0.2
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_gspo_cold_then_mask"
+
+ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/multi_stage_rl_log/${WANDB_GROUP}"
 
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  # <<<------  which GPUs to use, directly fill here
@@ -47,13 +49,13 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
    --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
-   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
+   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
    --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
    --save-interval 20
-   --save-retain-interval 60
-   # --finetune
-   # --start-rollout-id 0
-   # --skip-eval-before-train False
+   --save-retain-interval 40
+   --finetune
+   --start-rollout-id 0
+   --skip-eval-before-train True
 )
 
 # --finetune 的效果（参见 Megatron 的 checkpointing.py 第 1711 行）：
@@ -61,13 +63,13 @@ CKPT_ARGS=(
 # iteration 从 0 重新开始，不会接着 math 的 iteration 继续计数
 
 ROLLOUT_ARGS=(
-   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
+   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train_filtered_conf.parquet
    --input-key prompt
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 1000
-   --override-opt-param-scheduler
+   --num-rollout 500
+   # --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 5
    --rollout-max-response-len 2048

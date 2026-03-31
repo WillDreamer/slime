@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 TAU_CONFIGS = {
     "env": "retail",  # Select between ["retail", "airline"]
     "agent": "tool-calling",  # Select between ["tool-calling", "act", "react", "few-shot"]
-    "user_model": "gpt-4o-mini-2024-07-18",  # Cheap Model for user simulator
+    "user_model": "zai-org/GLM-4.7-Flash",  # Cheap Model for user simulator
     "task_split": "train",  # Select between ["train", "test", "dev"] for retail
     "user_strategy": "llm",  # Select between ["llm", "react", "verify", "reflection"]
     "model_provider": "auto_router",  # Unused, required

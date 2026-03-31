@@ -1,6 +1,40 @@
+import json
 import random
 import re
 import string
+
+
+def _parse_bare_json_tool_call(text: str):
+    """Fallback: match bare {"name": "search", "arguments": {...}} without <tool_call> tags.
+
+    Returns (action, content) where action is 'search' or None.
+    """
+    pattern = r'\{[^{}]*"name"\s*:\s*"search"[^{}]*"arguments"\s*:\s*\{[^{}]*\}[^{}]*\}'
+    match = re.search(pattern, text)
+    if not match:
+        pattern = r'\{[^{}]*"arguments"\s*:\s*\{[^{}]*\}[^{}]*"name"\s*:\s*"search"[^{}]*\}'
+        match = re.search(pattern, text)
+    if not match:
+        return None, ""
+    try:
+        data = json.loads(match.group(0))
+    except Exception:
+        return None, ""
+    name = data.get("name")
+    if name != "search":
+        return None, ""
+    arguments = data.get("arguments") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            return None, ""
+    if not isinstance(arguments, dict):
+        return None, ""
+    query = arguments.get("query", "")
+    if not isinstance(query, str):
+        return None, ""
+    return "search", query.strip()
 
 
 def normalize_answer(s):
@@ -45,8 +79,8 @@ def is_valid_sequence(text):
     start_pos = assistant_match.end()
     content = text[start_pos:]
 
-    # Check for balanced tags
-    tags_to_check = ["think", "tool_call", "tool_response", "answer"]
+    # Check for balanced tags (no longer require think tags)
+    tags_to_check = ["tool_call", "tool_response", "answer"]
     for tag in tags_to_check:
         opening_count = len(re.findall(f"<{tag}>", content))
         closing_count = len(re.findall(f"</{tag}>", content))
@@ -58,12 +92,13 @@ def is_valid_sequence(text):
 
     # Now check for proper sequence pattern and no extraneous content
 
-    # 1. First split the content by any tags we recognize
-    split_pattern = r"(</?(?:think|tool_call|tool_response|answer)>)"
+    # 1. First split the content by any tags we recognize (without think)
+    split_pattern = r"(</?(?:tool_call|tool_response|answer)>)"
     parts = re.split(split_pattern, content)
 
     # 2. Keep track of the current position in the expected sequence
-    state = "start"  # start -> think -> tool_call -> tool_response -> think -> ... -> answer -> end
+    # start -> [tool_call -> tool_response ->]* answer -> end
+    state = "start"
 
     # 3. Check each part
     for _i, part in enumerate(parts):
@@ -72,13 +107,9 @@ def is_valid_sequence(text):
             continue
 
         # Check if this is a tag
-        if re.match(r"</?(?:think|tool_call|tool_response|answer)>", part):
+        if re.match(r"</?(?:tool_call|tool_response|answer)>", part):
             # This is a tag, check if it's valid in the current state
-            if part == "<think>" and state in ["start", "tool_response"]:
-                state = "in_think"
-            elif part == "</think>" and state == "in_think":
-                state = "after_think"
-            elif part == "<tool_call>" and state == "after_think":
+            if part == "<tool_call>" and state in ["start", "tool_response"]:
                 state = "in_tool_call"
             elif part == "</tool_call>" and state == "in_tool_call":
                 state = "after_tool_call"
@@ -86,7 +117,7 @@ def is_valid_sequence(text):
                 state = "in_tool_response"
             elif part == "</tool_response>" and state == "in_tool_response":
                 state = "tool_response"
-            elif part == "<answer>" and state == "after_think":
+            elif part == "<answer>" and state in ["start", "after_tool_call", "tool_response"]:
                 state = "in_answer"
             elif part == "</answer>" and state == "in_answer":
                 state = "end"
@@ -94,16 +125,13 @@ def is_valid_sequence(text):
                 return False, f"Unexpected tag {part} in state {state}"
         else:
             # This is content, check if it's valid in the current state
-            if state in ["in_think", "in_tool_call", "in_tool_response", "in_answer"]:
+            if state in ["in_tool_call", "in_tool_response", "in_answer"]:
                 # Content is allowed inside tags
                 pass
-            elif state in ["start", "after_think", "after_tool_call", "tool_response"]:
-                # Only whitespace is allowed between tags
-                if part.strip():
-                    return (
-                        False,
-                        f"Unexpected content '{part.strip()}' between tags (state: {state})",
-                    )
+            elif state in ["start", "after_tool_call", "tool_response", "end"]:
+                # Allow free-form content outside tags (e.g. reasoning without <think>)
+                # Also allow trailing content after </answer> (e.g. <|endoftext|>)
+                pass
             else:
                 return False, f"Unexpected content in state {state}"
 
@@ -168,6 +196,10 @@ def compute_score_em(
     if is_valid_format:
         retrieval_correct = is_retrieval_correct(solution_str, ground_truth["target"])
     answer = extract_solution(solution_str=solution_str)
+    has_tool_call = (
+        "<tool_call>" in solution_str
+        or _parse_bare_json_tool_call(solution_str)[0] is not None
+    )
     do_print = random.randint(1, 64) == 1
 
     if do_print:
@@ -183,18 +215,26 @@ def compute_score_em(
             else:
                 return structure_format_score  # 0.2
         else:
-            return -0.1
+            return final_format_score # -0.1
     else:
         if em_check(answer, ground_truth["target"]):
             if is_valid_format:
-                return score  # 1
+                if has_tool_call:
+                    return score  # 1
+                else:
+                    return 0  # no tool_call → same as worst (-0.1)
             else:
                 return 0.6 * score - structure_format_score  # 0.2
         elif is_valid_format:
             if retrieval_correct:
-                return structure_format_score + retrieval_score  # 0.3
+                return structure_format_score + retrieval_score  # 0.4
+            elif has_tool_call:
+                return structure_format_score + 0.1 # 0.3
             else:
-                return structure_format_score  # 0.2
+                return 0  # 降低到0，不给纯<answer>的序列打分
         else:
-            return final_format_score  # 0.1
+            if has_tool_call:
+                return structure_format_score # 鼓励调用工具
+            else:   
+                return final_format_score  # -0.1
 

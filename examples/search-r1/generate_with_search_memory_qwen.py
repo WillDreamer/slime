@@ -3,7 +3,7 @@ import json
 import logging
 import re
 
-from qa_em_format_qwen import compute_score_em, is_valid_sequence, em_check, extract_solution  # type: ignore
+from qa_em_format_qwen import compute_score_em, is_valid_sequence, em_check, extract_solution, is_retrieval_correct  # type: ignore
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
@@ -465,11 +465,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 # 答对 + 格式正确	1.0	满分
-# 答对 + 格式不对	0.4	0.6*score - structure_format_score = 0.5 - 0.2
+# 答对 + 格式不对	0.4	0.6*score - structure_format_score = 0.6 - 0.2
 # 答错 + 格式正确 + 检索到答案	0.3	structure_format_score + retrieval_score = 0.2 + 0.1
 # 答错 + 格式正确 + 没检索到	0.2	structure_format_score = 0.2
 # 答错 + 格式不对	-0.1	final_format_score = -0.1
-# 没提取到答案 + 格式不对	0	最低
+# 没提取到答案 + 格式不对	-0.1	最低
 async def reward_func(args, sample, **kwargs):
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
@@ -481,7 +481,7 @@ async def reward_func(args, sample, **kwargs):
         ground_truth=sample.label["ground_truth"],
         structure_format_score=fmt,
         final_format_score=-0.1,
-        retrieval_score=fmt * 0.5,
+        retrieval_score=fmt,
     )
 
     # Track tool calling and format metrics for wandb
@@ -495,6 +495,7 @@ async def reward_func(args, sample, **kwargs):
     sample.metadata["valid_format"] = int(is_valid)
     sample.metadata["has_tool_call"] = int(has_tool_call)
     sample.metadata["answer_correct"] = int(answer_correct)
+    sample.metadata["retrieval_correct"] = int(is_retrieval_correct(solution_str, sample.label["ground_truth"]["target"]))
 
     return score
 

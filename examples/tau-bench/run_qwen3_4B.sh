@@ -24,7 +24,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 ROOT_DIR=/data1/whx
-WANDB_API_KEY="ba70fcbc92808cc7a1750dd80ac3908295e6854f"
+WANDB_API_KEY="${WANDB_API_KEY}"
 
 GPU_LIST=(4 5 6 7)  # <<<------  which GPUs to use, directly fill here
 CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
@@ -69,11 +69,11 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 1
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 1
+   --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform

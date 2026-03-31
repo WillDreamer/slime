@@ -29,11 +29,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
-ROLLOUT_BATCH_SIZE=8
-GLOBAL_BATCH_SIZE=64
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v1"
+ROLLOUT_BATCH_SIZE=64
+GLOBAL_BATCH_SIZE=320
 
-ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/${WANDB_GROUP}"
+## v3 加大kl 0.1,答对但没有toolcall降到0.2
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_filtered_conf_hack_v3"
+
+## v2 答对但没有toolcall降到0.3, 格式不对但有toolcall提升到0.2
+# WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_filtered_conf_hack_v2"
+
+ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/multi_stage_rl_log/${WANDB_GROUP}"
 
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  # <<<------  which GPUs to use, directly fill here
@@ -48,12 +53,12 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
    --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
    --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
-   --save ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_search_strict_v1/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_filtered_conf_hack_v3/
    --save-interval 20
-   --save-retain-interval 60
+   --save-retain-interval 40
    --finetune
    --start-rollout-id 0
-   # --skip-eval-before-train False
+   --skip-eval-before-train True
 )
 
 # --finetune 的效果（参见 Megatron 的 checkpointing.py 第 1711 行）：
@@ -61,22 +66,22 @@ CKPT_ARGS=(
 # iteration 从 0 重新开始，不会接着 math 的 iteration 继续计数
 
 ROLLOUT_ARGS=(
-   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
+   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train_filtered_conf.parquet
    --input-key prompt
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 3000
+   --num-rollout 500
    # --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
-   --n-samples-per-prompt 8
+   --n-samples-per-prompt 5
    --rollout-max-response-len 2048
    --rollout-temperature 1
 
    # eval args
    --eval-interval 25
    # --eval-prompt-data nq_test ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
-   --eval-prompt-data nq_test /data1/whx/ARLArena/datasets/data/searchR1_processed_direct/test_small.parquet
+   --eval-prompt-data nq_test ${ROOT_DIR}/ARLArena/datasets/data/searchR1_processed_direct/test_small.parquet
    --eval-input-key prompt
    --eval-label-key reward_model
    --n-samples-per-eval-prompt 1
@@ -101,13 +106,13 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 10240
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.001
+   --kl-loss-coef 0.1
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
@@ -140,7 +145,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    # MoE related args
    --rollout-num-gpus-per-engine ${NUM_GPUS}
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.62
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    # --sglang-enable-dp-attention
@@ -161,8 +166,8 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_search_memory_qwen.generate
-   --custom-rm-path generate_with_search_memory_qwen.reward_func
+   --custom-generate-function-path generate_with_search_tools_qwen.generate
+   --custom-rm-path generate_with_search_tools_qwen.reward_func
 
    # TIS-related args, recommended to enable when using TIS
    --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
@@ -179,6 +184,9 @@ export RAY_memory_usage_threshold=0.99
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=false
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
+export RAY_TMPDIR="/data1/ray_out"
+rm -rf "$RAY_TMPDIR"
+mkdir -p "$RAY_TMPDIR"
 
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --temp-dir ${MODEL_ROOT}/ray_temp 
 

@@ -1174,6 +1174,10 @@ def compute_metrics_from_samples(args, samples):
     if answer_corrects:
         log_dict["answer_correct_rate"] = np.mean(answer_corrects).item()
 
+    retrieval_corrects = [s.metadata.get("retrieval_correct") for s in samples if s.metadata.get("retrieval_correct") is not None]
+    if retrieval_corrects:
+        log_dict["retrieval_correct_rate"] = np.mean(retrieval_corrects).item()
+
     return log_dict
 
 
