@@ -107,4 +107,27 @@ Goal: measure how evenly tokens are distributed across experts during RL trainin
 
 ### Experiment setup
 
-Target model: Qwen3-30B-A3B (128 experts). Running on Anvil cluster (Slurm + Apptainer). See `debug_moe_balance.sbatch` for the working job script and `MOE_BALANCE_TRACKING.md` for full documentation.
+Target model: Qwen3-30B-A3B **base** (NOT Instruct), HuggingFace ID: `Qwen/Qwen3-30B-A3B`. 128 experts, top-8, 48 MoE layers.
+
+Task: IFBench (instruction-following, `--rm-type ifbench`). Pure local rule-based reward, no external API needed. Dataset: `IFBench_eval.jsonl` from `Coldog2333/IFBench` on HuggingFace.
+
+### How to run the debug experiment
+
+**Prerequisites:**
+1. Docker image: `slimerl/slime:latest` (contains Megatron-LM, SGLang, Ray, all dependencies)
+2. Download model: `huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir /path/to/Qwen3-30B-A3B`
+3. Convert checkpoint (requires GPU): `python tools/convert_hf_to_torch_dist.py` with model args from `scripts/models/qwen3-30B-A3B.sh`
+4. Download IFBench data: `huggingface-cli download Coldog2333/IFBench IFBench_eval.jsonl --repo-type dataset --local-dir /path/to/ifbench`
+
+**Minimum parallelism:** TP=2, EP=2 (2 GPUs minimum), `--colocate` mode.
+
+**Reference scripts:**
+- `debug_moe_balance.sbatch` — Anvil cluster (Slurm + Apptainer, H100)
+- `setup_h200_docker.sh` — Direct-access server (Docker, H200)
+
+### Known issues and fixes
+
+- `--optimizer-cpu-offload` requires `--use-precision-aware-optimizer` (Megatron assertion). Both flags are included in the scripts even though forward-only mode doesn't use the optimizer.
+- Checkpoint conversion (`convert_hf_to_torch_dist.py`) requires GPU — cannot run on login nodes.
+- Container image must be `slimerl/slime:latest`, NOT `slimerl/sglang:*` (missing megatron-core and ray).
+- `MOE_BALANCE_DATA_DIR` env var was renamed to `MOE_BALANCE_OUTPUT_DIR` in the runtime env config.
