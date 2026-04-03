@@ -410,9 +410,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
+        forward_only_mode = os.environ.get("MOE_BALANCE_FORWARD_ONLY", "0") == "1"
+
         with inverse_timer("train_wait"), timer("train"):
-            if self.args.compute_advantages_and_returns:
-                if "ref" in self.weights_backuper.backup_tags:
+            if self.args.compute_advantages_and_returns or forward_only_mode:
+                if not forward_only_mode and "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
@@ -425,7 +427,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
-                if "teacher" in self.weights_backuper.backup_tags:
+                if not forward_only_mode and "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("teacher")
@@ -438,7 +440,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if forward_only_mode or not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -453,6 +455,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
+
+                if forward_only_mode:
+                    logger.info("MOE_BALANCE_FORWARD_ONLY: skipping training step, only forward pass was executed")
+                    return
 
                 if self.args.use_critic:
                     sync_actor_critic_data(

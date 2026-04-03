@@ -21,6 +21,7 @@ from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
+from slime.utils.expert_balance import compute_expert_balance_from_samples, save_rollout_expert_counts
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -1192,6 +1193,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
 
+    # Save raw expert counts for offline visualization
+    num_experts = getattr(args, "num_experts", None)
+    if num_experts is not None:
+        save_rollout_expert_counts(samples, num_experts, step)
+
 
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
@@ -1202,6 +1208,15 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
+
+    # MoE expert balance metrics (inference side)
+    num_experts = getattr(args, "num_experts", None)
+    if num_experts is not None and any(getattr(s, "rollout_routed_experts", None) is not None for s in samples):
+        log_dict |= dict_add_prefix(
+            compute_expert_balance_from_samples(samples, num_experts),
+            "moe_balance/",
+        )
+
     return log_dict
 
 

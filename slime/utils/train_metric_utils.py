@@ -41,8 +41,16 @@ def log_perf_data_raw(
             log_dict["perf/step_time"] = total_time
             log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
 
+    step = compute_rollout_step(args, rollout_id)
+
+    # MoE expert balance metrics (training side)
+    from slime.utils.routing_replay import TrainingExpertBalanceTracker
+
+    balance_metrics = TrainingExpertBalanceTracker.get_instance().get_metrics_and_reset(step=step)
+    if balance_metrics:
+        log_dict |= balance_metrics
+
     logger.info(f"perf {rollout_id}: {log_dict}")
 
-    step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
