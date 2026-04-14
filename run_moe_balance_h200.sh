@@ -1,79 +1,58 @@
 #!/bin/bash
 # =============================================================
-# MoE Balance Debug - H200 Server Setup (Docker)
+# MoE Balance Static Measurement - H200 Server (hhzhang)
 # =============================================================
-# Prerequisites: Docker with GPU support (nvidia-docker), 2+ GPUs
-# Model: Qwen3-30B-A3B base (NOT Instruct)
-# Task: IFBench (local reward, no external API)
+# Measures expert load balance of a pretrained MoE model WITHOUT
+# any RL training (forward-only mode, no weight updates).
+# Compares routing decisions between SGLang (inference) and
+# Megatron (training forward pass) on the same data.
+#
+# Usage:
+#   bash run_moe_balance_h200.sh <run_id> [gpu_devices] [num_rollout]
+#
+# Examples:
+#   bash run_moe_balance_h200.sh 1                # run 1, default GPU 0,2
+#   bash run_moe_balance_h200.sh 2 2,4            # run 2, GPU 2,4
+#   bash run_moe_balance_h200.sh 3 0,2 10         # run 3, GPU 0,2, 10 rollouts
+#
+# Output is saved to: /data1/hhzhang/moe_balance/base_ifbench_output_<run_id>/
 # =============================================================
 
 set -ex
 
 # ============================================================
-# 1. Config - modify these paths for your server
+# 1. Config
 # ============================================================
-WORKDIR=/data/moe_balance          # change to your preferred path
-REPO_DIR=$(cd "$(dirname "$0")" && pwd)  # slime repo root
+RUN_ID=${1:?  "Usage: bash run_moe_balance_h200.sh <run_id> [gpu_devices] [num_rollout]"}
+GPU_DEVICES=${2:-"0,2"}
+NUM_ROLLOUT=${3:-38}              # 38 rollouts * 8 samples = 304, covers all 300 IFBench samples
+NUM_GPUS=2                        # minimum 2 for TP=2, EP=2
+
+REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 DOCKER_IMAGE=slimerl/slime:latest
-HF_MODEL_ID=Qwen/Qwen3-30B-A3B
 
-HF_CKPT=${WORKDIR}/Qwen3-30B-A3B
-TORCH_DIST_CKPT=${WORKDIR}/Qwen3-30B-A3B_torch_dist
-SLIME_CKPT=${WORKDIR}/Qwen3-30B-A3B_slime
-IFBENCH_DATA=${WORKDIR}/ifbench/IFBench_eval.jsonl
-BALANCE_OUTPUT=${WORKDIR}/moe_balance_output
-NUM_GPUS=2   # minimum 2 for TP=2, EP=2
+HF_CKPT=/xuanwu-tank/north/hhzhang/hf_cache/models/Qwen3-30B-A3B
+TORCH_DIST_CKPT=/data1/hhzhang/moe_balance/Qwen3-30B-A3B_torch_dist
+SLIME_CKPT=/data1/hhzhang/moe_balance/Qwen3-30B-A3B_slime
+IFBENCH_DATA=/xuanwu-tank/north/xw27/multi/slime/examples/ifbench/IFBench_eval.jsonl
+BALANCE_OUTPUT=/data1/hhzhang/moe_balance/base_ifbench_output_${RUN_ID}
 
-mkdir -p ${WORKDIR} ${BALANCE_OUTPUT}
+mkdir -p ${SLIME_CKPT} ${BALANCE_OUTPUT}
 
 # ============================================================
-# 2. Pull Docker image
+# 2. Convert checkpoint if needed (single GPU)
 # ============================================================
-docker pull ${DOCKER_IMAGE}
-
-# ============================================================
-# 3. Download model (HuggingFace)
-# ============================================================
-if [ ! -d "${HF_CKPT}" ]; then
-    echo "=== Downloading Qwen3-30B-A3B base checkpoint ==="
-    # Option A: huggingface-cli (if available on host)
-    # huggingface-cli download ${HF_MODEL_ID} --local-dir ${HF_CKPT}
-    # Option B: inside container
-    docker run --rm \
-        -v ${WORKDIR}:${WORKDIR} \
-        ${DOCKER_IMAGE} \
-        huggingface-cli download ${HF_MODEL_ID} --local-dir ${HF_CKPT}
-else
-    echo "=== HF checkpoint already exists, skipping ==="
-fi
-
-# ============================================================
-# 4. Download IFBench data
-# ============================================================
-if [ ! -f "${IFBENCH_DATA}" ]; then
-    echo "=== Downloading IFBench dataset ==="
-    mkdir -p ${WORKDIR}/ifbench
-    docker run --rm \
-        -v ${WORKDIR}:${WORKDIR} \
-        ${DOCKER_IMAGE} \
-        bash -c "pip install huggingface_hub && python -c \"
-from huggingface_hub import hf_hub_download
-hf_hub_download(repo_id='Coldog2333/IFBench', filename='IFBench_eval.jsonl',
-                repo_type='dataset', local_dir='${WORKDIR}/ifbench')
-\""
-else
-    echo "=== IFBench data already exists, skipping ==="
-fi
-
-# ============================================================
-# 5. Convert checkpoint: HF -> torch_dist (needs GPU)
-# ============================================================
-if [ ! -d "${TORCH_DIST_CKPT}" ]; then
+if [ ! -f "${TORCH_DIST_CKPT}/latest_checkpointed_iteration.txt" ]; then
     echo "=== Converting HF checkpoint to torch_dist ==="
-    docker run --rm --gpus all \
-        -v ${WORKDIR}:${WORKDIR} \
+    FIRST_GPU=$(echo ${GPU_DEVICES} | cut -d',' -f1)
+    docker run --rm --gpus "\"device=${FIRST_GPU}\"" \
+        --ipc=host --ulimit memlock=-1 \
+        -v /xuanwu-tank:/xuanwu-tank \
+        -v /data1/hhzhang/moe_balance:/data1/hhzhang/moe_balance \
         -v ${REPO_DIR}:${REPO_DIR} \
         -w ${REPO_DIR} \
+        -e PYTHONPATH=/root/Megatron-LM/ \
+        -e CUDA_DEVICE_MAX_CONNECTIONS=1 \
         ${DOCKER_IMAGE} \
         bash -c "
             source scripts/models/qwen3-30B-A3B.sh
@@ -83,20 +62,21 @@ if [ ! -d "${TORCH_DIST_CKPT}" ]; then
                 --save ${TORCH_DIST_CKPT}
         "
     echo "=== Checkpoint conversion done ==="
-else
-    echo "=== torch_dist checkpoint already exists, skipping ==="
 fi
 
 # ============================================================
-# 6. Run forward-only MoE balance debug
+# 3. Run forward-only MoE balance debug
 # ============================================================
 echo "=== Starting MoE balance forward-only debug ==="
+echo "=== GPUs: ${GPU_DEVICES}, Rollouts: ${NUM_ROLLOUT} ==="
 
-docker run --rm --gpus all \
+docker run --rm --gpus "\"device=${GPU_DEVICES}\"" \
     --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
-    -v ${WORKDIR}:${WORKDIR} \
+    -v /xuanwu-tank:/xuanwu-tank \
+    -v /data1/hhzhang/moe_balance:/data1/hhzhang/moe_balance \
     -v ${REPO_DIR}:${REPO_DIR} \
     -w ${REPO_DIR} \
+    -e PYTHONPATH=/root/Megatron-LM/ \
     ${DOCKER_IMAGE} \
     bash -c '
 set -ex
@@ -105,7 +85,6 @@ source scripts/models/qwen3-30B-A3B.sh
 
 NUM_GPUS='"${NUM_GPUS}"'
 
-# Start Ray head
 ray start --head --node-ip-address 127.0.0.1 --num-gpus ${NUM_GPUS} \
     --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
@@ -137,7 +116,8 @@ ray job submit --address="http://127.0.0.1:8265" \
     --metadata-key metadata \
     --apply-chat-template \
     --rm-type ifbench \
-    --num-rollout 2 \
+    --use-rollout-routing-replay \
+    --num-rollout '"${NUM_ROLLOUT}"' \
     --rollout-batch-size 8 \
     --n-samples-per-prompt 1 \
     --rollout-max-response-len 2048 \
@@ -155,7 +135,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     --use-dynamic-batch-size \
     --max-tokens-per-gpu 4096 \
     --rollout-num-gpus-per-engine 2 \
-    --sglang-mem-fraction-static 0.6 \
+    --sglang-mem-fraction-static 0.5 \
     --advantage-estimator grpo \
     --eps-clip 0.2 \
     --optimizer adam \
@@ -171,4 +151,4 @@ ray job submit --address="http://127.0.0.1:8265" \
     --attention-backend flash
 '
 
-echo "=== Done! Balance output: ${BALANCE_OUTPUT} ==="
+echo "=== Done! Run ${RUN_ID} output: ${BALANCE_OUTPUT} ==="

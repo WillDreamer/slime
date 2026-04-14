@@ -442,7 +442,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if forward_only_mode or not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
-                        if self.args.use_rollout_routing_replay:
+                        if forward_only_mode:
+                            # In forward-only mode, record Megatron's own routing
+                            # instead of replaying SGLang's (token counts may differ)
+                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                        elif self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
@@ -458,6 +462,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 if forward_only_mode:
                     logger.info("MOE_BALANCE_FORWARD_ONLY: skipping training step, only forward pass was executed")
+                    log_perf_data(rollout_id, self.args)
                     return
 
                 if self.args.use_critic:
@@ -521,6 +526,8 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
+            return
+        if os.environ.get("MOE_BALANCE_FORWARD_ONLY", "0") == "1":
             return
 
         # torch dist may trigger nccl communication during saving.

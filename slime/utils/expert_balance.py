@@ -278,7 +278,7 @@ def save_training_expert_counts(
     for layer_idx, arr in layer_data.items():
         flat = arr.reshape(-1)
         counts[layer_idx] = np.bincount(flat, minlength=num_experts)
-        total_tokens = max(total_tokens, arr.shape[0])
+        total_tokens += arr.shape[0]
 
     save_dir = os.path.join(data_dir, "train")
     os.makedirs(save_dir, exist_ok=True)
