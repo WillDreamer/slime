@@ -7,8 +7,6 @@ ray stop --force
 pkill -9 ray
 pkill -9 python
 sleep 3
-# pkill -9 ray
-# pkill -9 python
 
 set -ex
 
@@ -31,7 +29,7 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
 ROLLOUT_BATCH_SIZE=64
 GLOBAL_BATCH_SIZE=320
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_gspo_cold_then_mask_resume"
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_gspo_resume_think"
 
 ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/${WANDB_GROUP}"
 
@@ -47,8 +45,9 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
    --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
+   # Resume from the 1000-step checkpoint of the previous run
    --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_gspo_resume_think/
    --save-interval 20
    --save-retain-interval 60
    # --finetune
@@ -56,26 +55,23 @@ CKPT_ARGS=(
    # --skip-eval-before-train False
 )
 
-# --finetune 的效果（参见 Megatron 的 checkpointing.py 第 1711 行）：
-# 只加载模型权重，跳过 optimizer 和 lr scheduler 的状态恢复
-# iteration 从 0 重新开始，不会接着 math 的 iteration 继续计数
-
 ROLLOUT_ARGS=(
    --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
    --input-key prompt
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 1000
+   --num-rollout 2000
    --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 5
    --rollout-max-response-len 2048
    --rollout-temperature 1
 
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+
    # eval args
    --eval-interval 25
-   # --eval-prompt-data nq_test ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
    --eval-prompt-data nq_test ${ROOT_DIR}/ARLArena/datasets/data/searchR1_processed_direct/test_small.parquet
    --eval-input-key prompt
    --eval-label-key reward_model
@@ -143,8 +139,6 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.7
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   # --sglang-enable-dp-attention
-   # --sglang-dp-size 8
 )
 
 MISC_ARGS=(
@@ -157,12 +151,13 @@ MISC_ARGS=(
    # need to comment this when using model with MLA
    --attention-backend flash
 
-   --distributed-timeout-minutes 60 
+   --distributed-timeout-minutes 60
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_search_tools_qwen.generate
-   --custom-rm-path generate_with_search_tools_qwen.reward_func
+   # Use _think variants for forced <think>...</think> reasoning
+   --custom-generate-function-path generate_with_search_tools_qwen_think.generate
+   --custom-rm-path generate_with_search_tools_qwen_think.reward_func
 
    # TIS-related args, recommended to enable when using TIS
    --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
@@ -171,7 +166,6 @@ CUSTOM_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-# export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${PYTHONPATH}"
 export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${SCRIPT_DIR}:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE="${HAS_NVLINK}"
@@ -183,18 +177,7 @@ export RAY_TMPDIR="/data1/ray_out"
 rm -rf "$RAY_TMPDIR"
 mkdir -p "$RAY_TMPDIR"
 
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --temp-dir ${MODEL_ROOT}/ray_temp 
-
-# RUNTIME_ENV_JSON="{
-#   \"env_vars\": {
-#     \"PYTHONPATH\": \"${ROOT_DIR}/Megatron-LM/:${SCRIPT_DIR}\",
-#     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
-#   }
-# }"
-
-# ray job submit --address="http://127.0.0.1:8265" \
-#    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-#    -- python3 train.py \
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --temp-dir ${MODEL_ROOT}/ray_temp
 
 export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
 python3 train.py \

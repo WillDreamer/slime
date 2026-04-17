@@ -46,8 +46,8 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
-   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
+   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
+   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
    --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_tau_async/
    --save-interval 20
    --save-retain-interval 40
@@ -64,12 +64,14 @@ ROLLOUT_ARGS=(
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 8
    --rollout-max-response-len 1024
+   --rollout-max-context-len 131072
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std 
    --rollout-temperature 1
    --global-batch-size ${GLOBAL_BATCH_SIZE}
    --balance-data
    --save-debug-rollout-data "${ROLLOUT_DEBUG_DIR}/rollout_{rollout_id}.pt"
 )
-# --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std 
+
 
 EVAL_ARGS=(
    --eval-interval 20
@@ -94,9 +96,9 @@ PERF_ARGS=(
 )
 
 GRPO_ARGS=(
-   --advantage-estimator grpo
+   --advantage-estimator gspo
    --use-kl-loss
-   --kl-loss-coef 0.00
+   --kl-loss-coef 0.001
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
@@ -127,9 +129,13 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    # Reduced from 8 to 4 GPUs per engine to match the rollout GPU budget
    --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.6
+   --sglang-mem-fraction-static 0.8
    # ep-size=4 with 4 GPUs: each GPU holds different experts (TP=1, EP=4)
    --sglang-ep-size 4
+   --sglang-max-total-tokens 1500000
+   # YaRN: extend context to 131072 (4x the native 32768)
+   --sglang-context-length 131072
+   --sglang-json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'
 )
 
 MISC_ARGS=(
@@ -149,6 +155,7 @@ CUSTOM_ARGS=(
    --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
 
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export RAY_TMPDIR="/data1/ray_out"

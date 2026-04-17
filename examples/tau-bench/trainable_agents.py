@@ -33,6 +33,7 @@ class InteractionResult:
     loss_mask: list[int] | None = None
     tokens: int | None = None
     status: Status = Status.COMPLETED
+    rollout_log_probs: list[float] | None = None
 
 
 def call_to_action_sglang(calls: list[Any], text_response: str) -> Action:
@@ -123,9 +124,9 @@ class TrainableAgentMixin:
         Returns:
             Environment step result
         """
-        return env.step(action)
+        return await env.step(action)
 
-    def _initialize_environment(self, env, task_index: int | None) -> tuple[str, dict[str, Any]]:
+    async def _initialize_environment(self, env, task_index: int | None) -> tuple[str, dict[str, Any]]:
         """
         Initialize the environment and get initial observation.
 
@@ -137,9 +138,9 @@ class TrainableAgentMixin:
             Tuple of (observation, info)
         """
         if task_index is not None:
-            env_reset_res = env.reset(task_index=task_index)
+            env_reset_res = await env.reset(task_index=task_index)
         else:
-            env_reset_res = env.reset()
+            env_reset_res = await env.reset()
         return env_reset_res.observation, env_reset_res.info.model_dump()
 
     def _build_initial_messages(self, obs: str) -> list[dict[str, Any]]:
@@ -203,7 +204,7 @@ class TrainableAgentMixin:
         url = f"http://{rollout_args.sglang_router_ip}:" f"{rollout_args.sglang_router_port}/generate"
 
         # Get initial environment state
-        obs, info = self._initialize_environment(env, task_index)
+        obs, info = await self._initialize_environment(env, task_index)
 
         # Build initial conversation
         messages = self._build_initial_messages(obs)
@@ -212,6 +213,7 @@ class TrainableAgentMixin:
         # Initialize tracking variables
         loss_masks = []
         response_token_ids = []
+        rollout_log_probs = []
         total_reward = 0.0
 
         # Initialize result
@@ -225,16 +227,22 @@ class TrainableAgentMixin:
             )
             # Reformulate tool call instruction for tau-bench
             text_input = self._reformulate_tool_call(text_input)
-            payload = {"text": text_input, "sampling_params": sampling_params}
+            payload = {"text": text_input, "sampling_params": sampling_params, "return_logprob": True}
 
             # Send request to sglang server
             output = await self._call_llm(url, payload)
+
+            # Collect per-token log probs for agent turn (assistant tokens)
+            agent_token_logprobs = [
+                item[0] for item in output["meta_info"].get("output_token_logprobs", [])
+            ]
 
             # Check for abort
             if output["meta_info"]["finish_reason"]["type"] == "abort":
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
+                    rollout_log_probs
                 )
 
             response = output["text"]
@@ -255,7 +263,8 @@ class TrainableAgentMixin:
                     )
                     res.status = Status.ABORTED
                     return self._build_final_result(
-                        res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                        res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
+                        rollout_log_probs
                     )
 
                 # Extract parsed results
@@ -269,14 +278,24 @@ class TrainableAgentMixin:
                 logger.warning(f"rollout response: {response} can not be parsed into " f"tool calls {e}")
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
+                    rollout_log_probs
                 )
 
             # Add assistant response to conversation
             messages.append({"role": "assistant", "content": response})
             assistant_token_ids, assistant_loss_mask = self._get_token_delta(state.tokenizer, messages)
+            n_agent = len(assistant_token_ids)
+            n_sglang = len(agent_token_logprobs)
+            # sglang may not return logprobs for stop/EOM tokens that _get_token_delta includes
+            # via the chat template. Zero out loss_mask for those positions so their fake 0.0
+            # rollout logprob (= prob 1.0) does not trigger the RS veto.
+            if n_sglang < n_agent:
+                assistant_loss_mask = [1] * n_sglang + [0] * (n_agent - n_sglang)
+            padded_lp = agent_token_logprobs[:n_agent] + [0.0] * max(0, n_agent - n_sglang)
             response_token_ids.extend(assistant_token_ids)
             loss_masks.extend(assistant_loss_mask)
+            rollout_log_probs.extend(padded_lp)
 
             # Execute action in environment
             agent_content, calls = parsed["normal_text"], parsed["calls"]
@@ -291,7 +310,8 @@ class TrainableAgentMixin:
                 logger.warning(f"Error: {e}")
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
+                    rollout_log_probs
                 )
 
             logger.debug(f"Environment response: reward={env_response.reward}, " f"done={env_response.done}")
@@ -313,6 +333,8 @@ class TrainableAgentMixin:
             env_token_ids, env_loss_mask = self._get_token_delta(state.tokenizer, messages)
             response_token_ids.extend(env_token_ids)
             loss_masks.extend(env_loss_mask)
+            # Pad rollout_log_probs with 0.0 for env/tool tokens (not trained on)
+            rollout_log_probs.extend([0.0] * len(env_token_ids))
 
             # Update reward and info
             total_reward = env_response.reward
@@ -328,7 +350,8 @@ class TrainableAgentMixin:
             res.status = Status.TRUNCATED
 
         return self._build_final_result(
-            res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+            res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
+            rollout_log_probs
         )
 
     def _get_token_delta(self, tokenizer: AutoTokenizer, messages: list[dict]) -> tuple[list[int], list[int]]:
@@ -375,6 +398,7 @@ class TrainableAgentMixin:
         loss_masks: list[int],
         prompt_token_ids: list[int],
         response_token_ids: list[int],
+        rollout_log_probs: list[float] | None = None,
     ) -> InteractionResult:
         """
         Build the final interaction result with all collected data.
@@ -387,6 +411,7 @@ class TrainableAgentMixin:
             loss_masks: Loss masks for training
             prompt_token_ids: Prompt token IDs
             response_token_ids: Response token IDs
+            rollout_log_probs: Per-token log probs for TIS (agent tokens real, env tokens 0.0)
 
         Returns:
             Populated InteractionResult
@@ -398,6 +423,7 @@ class TrainableAgentMixin:
         res.tokens = prompt_token_ids + response_token_ids
         res.response = "".join([msg.get("content", "") for msg in messages if msg["role"] == "assistant"])
         res.response_length = len(loss_masks)
+        res.rollout_log_probs = rollout_log_probs
 
         logger.debug(
             f"_build_final_result: response_length={res.response_length}, "

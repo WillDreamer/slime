@@ -393,14 +393,31 @@ class MessageContextWindowManager:
 
     @staticmethod
     def _format_tool_response(search_result: str) -> str:
-        """Format search result as a tool response observation.
+        """Format search result for build_context() (text-based).
 
-        Uses plain text <tool_response> tags within the assistant context,
-        matching what TOOL_CALLING_INSTRUCTION tells the model to expect.
-        This approach is model-agnostic and consistent with how
-        generate_with_search_memory_qwen uses <information> tags.
+        sglang includes <|im_end|> (and sometimes <|endoftext|>) in output["text"],
+        so model_text already closes the assistant turn.  We only need a newline
+        before <|im_start|>tool to match Qwen chat format.
         """
-        return f"\n<tool_response>\n{search_result}\n</tool_response>\n"
+        return (
+            f"\n<|im_start|>tool\n<tool_response>\n{search_result}\n</tool_response><|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    @staticmethod
+    def _format_tool_response_for_tokens(search_result: str) -> str:
+        """Format search result for build_training_data() (token-based).
+
+        Does NOT prepend <|im_end|>\\n because model_token_ids from sglang's
+        output_token_logprobs already contains the <|im_end|> token (151645)
+        as the last generated token.  Adding it again would produce a double
+        EOS in the training sequence.
+        """
+        return (
+            f"\n"
+            f"<|im_start|>tool\n<tool_response>\n{search_result}\n</tool_response><|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
 
     def add_turn(
         self,
@@ -443,14 +460,36 @@ class MessageContextWindowManager:
             return turn["search_result_full"]
         return turn["search_result_compressed"]
 
-    def build_context(self) -> str:
-        """Build the full context string for the next sglang call."""
+    def build_context(self, add_final_generation_prompt: bool = True) -> str:
+        """Build the full context string.
+
+        add_final_generation_prompt=True  (default): used during the inference
+            loop — always append \\n<|im_start|>assistant\\n after the last turn
+            so sglang knows to generate as the assistant on the next call.
+        add_final_generation_prompt=False: used after the loop to build
+            sample.response — the final answer/truncation turn should not have
+            a trailing generation prompt in the saved trajectory.
+        """
         context = self.prompt_text
         for i, turn in enumerate(self.turns):
-            context += turn["model_text"]
+            is_last = i == len(self.turns) - 1
+            # sglang may output <|endoftext|> as EOS; replace with <|im_end|>
+            # to match Qwen chat format.  On the last turn, keep <|endoftext|>
+            # after <|im_end|> so the sequence is properly terminated.
+            model_text = turn["model_text"]
+            if "<|endoftext|>" in model_text:
+                if is_last:
+                    model_text = model_text.replace(
+                        "<|endoftext|>", "<|im_end|><|endoftext|>"
+                    )
+                else:
+                    model_text = model_text.replace("<|endoftext|>", "<|im_end|>")
+            context += model_text
             search_result = self._get_search_result(i)
             if search_result is not None:
                 context += self._format_tool_response(search_result)
+            elif not is_last or add_final_generation_prompt:
+                context += "\n<|im_start|>assistant\n"
         return context
 
     def build_training_data(
@@ -466,17 +505,49 @@ class MessageContextWindowManager:
         loss_mask: list[int] = []
         rollout_log_probs: list[float] | None = [] if return_logprob else None
 
+        endoftext_id = self.tokenizer.convert_tokens_to_ids("<|endoftext|>")
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+
         for i, turn in enumerate(self.turns):
+            is_last = i == len(self.turns) - 1
+
             # === Assistant tokens (from sglang output, trainable) ===
-            response_token_ids += turn["model_token_ids"]
-            loss_mask += [1] * len(turn["model_token_ids"])
+            # sglang stops on <|endoftext|> (eos_token), but the model often
+            # generates <|im_end|> first (from chat-template training), producing
+            # [..., im_end, endoftext].  We need to normalise the tail to:
+            #   - non-last turn: [..., im_end]          (one im_end, no endoftext)
+            #   - last turn:     [..., im_end, endoftext]
+            # Strip all trailing im_end / endoftext, then re-append the correct ending.
+            cur_token_ids = list(turn["model_token_ids"])
+            cur_log_probs = list(turn["model_log_probs"]) if return_logprob else None
+            # Strip trailing special tokens
+            while cur_token_ids and cur_token_ids[-1] in (endoftext_id, im_end_id):
+                cur_token_ids.pop()
+                if cur_log_probs is not None:
+                    cur_log_probs.pop()
+            # Re-append correct ending
+            if is_last:
+                cur_token_ids.append(im_end_id)
+                cur_token_ids.append(endoftext_id)
+                if cur_log_probs is not None:
+                    cur_log_probs.append(0.0)
+                    cur_log_probs.append(0.0)
+            else:
+                cur_token_ids.append(im_end_id)
+                if cur_log_probs is not None:
+                    cur_log_probs.append(0.0)
+
+            response_token_ids += cur_token_ids
+            loss_mask += [1] * len(cur_token_ids)
             if return_logprob:
-                rollout_log_probs += turn["model_log_probs"]
+                rollout_log_probs += cur_log_probs
 
             # === Tool response tokens (environment, not trainable) ===
             search_result = self._get_search_result(i)
             if search_result is not None:
-                obs_text = self._format_tool_response(search_result)
+                # Use the token variant: model_token_ids already ends with the
+                # <|im_end|> token (151645), so we must NOT prepend it again.
+                obs_text = self._format_tool_response_for_tokens(search_result)
                 obs_token_ids = self.tokenizer(
                     obs_text, add_special_tokens=False
                 )["input_ids"]
@@ -484,6 +555,18 @@ class MessageContextWindowManager:
                 loss_mask += [0] * len(obs_token_ids)
                 if return_logprob:
                     rollout_log_probs += [0.0] * len(obs_token_ids)
+            elif i < len(self.turns) - 1:
+                # Intermediate turn with no search result (invalid action):
+                # model_token_ids already ends with <|im_end|>, so the separator
+                # only needs \n<|im_start|>assistant\n (no leading <|im_end|>).
+                sep_text = "\n<|im_start|>assistant\n"
+                sep_token_ids = self.tokenizer(
+                    sep_text, add_special_tokens=False
+                )["input_ids"]
+                response_token_ids += sep_token_ids
+                loss_mask += [0] * len(sep_token_ids)
+                if return_logprob:
+                    rollout_log_probs += [0.0] * len(sep_token_ids)
 
         return response_token_ids, loss_mask, rollout_log_probs
 
@@ -561,9 +644,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         cur_response = output["text"]
         last_finish_reason = output["meta_info"]["finish_reason"]["type"]
 
-        # Strip <|im_end|> if present (it's a template token, not model content)
-        if cur_response.endswith("<|im_end|>"):
-            cur_response = cur_response[:-10]
 
         # Get token IDs and log probs from sglang output
         if return_logprob:
@@ -635,8 +715,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         f"obs_full={stats['obs_full']}, obs_compressed={stats['obs_compressed']}"
     )
 
-    # Build response text from the final (compressed) context view
-    full_context = manager.build_context()
+    # Build response text from the final (compressed) context view.
+    # add_final_generation_prompt=False so the saved trajectory does not end
+    # with a dangling \n<|im_start|>assistant\n after the last turn.
+    full_context = manager.build_context(add_final_generation_prompt=False)
     response = full_context[len(prompt_text):]
 
     sample.tokens = prompt_token_ids + response_token_ids

@@ -561,6 +561,14 @@ class RolloutManager:
                     f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
                 )
             metrics = None
+            if len(data) % self.args.global_batch_size != 0:
+                trim_len = (len(data) // self.args.global_batch_size) * self.args.global_batch_size
+                if trim_len == 0:
+                    raise ValueError(
+                        f"Not enough samples {len(data)} for global_batch_size {self.args.global_batch_size}"
+                    )
+                logger.info(f"trim loaded debug rollout data from {len(data)} to {trim_len}")
+                data = data[:trim_len]
         else:
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             metrics = data.metrics
@@ -1170,6 +1178,10 @@ def compute_metrics_from_samples(args, samples):
     if tool_calls:
         log_dict["tool_call_rate"] = np.mean(tool_calls).item()
 
+    tool_call_turn_fracs = [s.metadata.get("tool_call_turn_frac") for s in samples if s.metadata.get("tool_call_turn_frac") is not None]
+    if tool_call_turn_fracs:
+        log_dict["tool_call_turn_frac"] = np.mean(tool_call_turn_fracs).item()
+
     answer_corrects = [s.metadata.get("answer_correct") for s in samples if s.metadata.get("answer_correct") is not None]
     if answer_corrects:
         log_dict["answer_correct_rate"] = np.mean(answer_corrects).item()
@@ -1177,6 +1189,11 @@ def compute_metrics_from_samples(args, samples):
     retrieval_corrects = [s.metadata.get("retrieval_correct") for s in samples if s.metadata.get("retrieval_correct") is not None]
     if retrieval_corrects:
         log_dict["retrieval_correct_rate"] = np.mean(retrieval_corrects).item()
+
+    # Log void masking metrics if available
+    void_masked_vals = [s.metadata.get("void_masked") for s in samples if s.metadata.get("void_masked") is not None]
+    if void_masked_vals:
+        log_dict["void_mask_rate"] = np.mean(void_masked_vals).item()
 
     return log_dict
 

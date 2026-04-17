@@ -38,7 +38,7 @@ TAU_CONFIGS = {
     "user_model_provider": "openai",   # unused
     # Sliding context window: only the last k turns are sent to SGLang for inference.
     # Prevents context-length overflow in long episodes (32768 token limit).
-    "context_window_k": 10,
+    "context_window_k": 3,
 }
 CONTEXT_WINDOW_K = TAU_CONFIGS.pop("context_window_k")
 tau_config = RunConfig(**TAU_CONFIGS)
@@ -46,9 +46,9 @@ tau_config = RunConfig(**TAU_CONFIGS)
 
 def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
     status_mapping = {
-        Status.COMPLETED: "completed",
-        Status.TRUNCATED: "truncated",
-        Status.ABORTED: "aborted",
+        Status.COMPLETED: Sample.Status.COMPLETED,
+        Status.TRUNCATED: Sample.Status.TRUNCATED,
+        Status.ABORTED: Sample.Status.ABORTED,
     }
     sample = Sample(
         index=task_index,
@@ -57,8 +57,9 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
         response=res.response,
         reward=res.reward,
         loss_mask=res.loss_mask,
-        status=status_mapping.get(res.status),
+        status=status_mapping.get(res.status, Sample.Status.FAILED),
         metadata=res.info,
+        rollout_log_probs=res.rollout_log_probs,
     )
     if hasattr(res, "response_length"):
         sample.response_length = res.response_length

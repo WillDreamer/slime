@@ -66,3 +66,24 @@ And run:
 cd /root/slime
 bash examples/tau-bench/run_qwen3_4B.sh
 ```
+
+---------
+
+## SFT
+Step 1: 收集轨迹
+```
+bash examples/tau-bench/run_qwen3_30B_rollout_only.sh
+```
+# 保存到 /data1/whx/tau_sft_rollout_data/rollout_{rollout_id}.pt
+Step 2: 过滤 & 转换
+```
+python examples/tau-bench/parse_rollout_to_sft.py \
+  --input-dir  /data1/whx/tau_sft_rollout_data \
+  --output-file /data1/whx/tau_sft_rollout_data/sft_data.jsonl \
+  --reward-threshold 1.0
+```
+# 会打印 reward 分布、过滤前后数量、序列长度统计
+Step 3: SFT 训练
+```
+bash examples/tau-bench/run_qwen3_30B_sft.sh
+```

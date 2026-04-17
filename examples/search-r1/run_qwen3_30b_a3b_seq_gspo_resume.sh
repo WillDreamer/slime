@@ -6,7 +6,7 @@ sleep 3
 ray stop --force
 pkill -9 ray
 pkill -9 python
-# sleep 3
+sleep 3
 # pkill -9 ray
 # pkill -9 python
 
@@ -14,11 +14,6 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-
-# 修改了user simulator，tau-bench的请求改成了异步请求
-export OPENAI_API_BASE=http://131.179.168.120:8099/v1
-export OPENAI_API_KEY=dummy
-
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -30,11 +25,16 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 ROOT_DIR=/data1/whx
 MODEL_ROOT=/data2/whx
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+echo "SCRIPT_DIR=${SCRIPT_DIR}"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
-ROLLOUT_BATCH_SIZE=8
-GLOBAL_BATCH_SIZE=64
-WANDB_GROUP="tau-bench_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}"
-ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/multi_stage_rl_log/${WANDB_GROUP}"
+ROLLOUT_BATCH_SIZE=64
+GLOBAL_BATCH_SIZE=320
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_gspo_cold_then_mask_format_void_resume"
+
+ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/${WANDB_GROUP}"
+
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  # <<<------  which GPUs to use, directly fill here
 CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
@@ -44,44 +44,47 @@ echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS=${#GPU_LIST[@]}
 echo "Detected ${NUM_GPUS} GPUs for this run"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-echo "SCRIPT_DIR=${SCRIPT_DIR}"
-source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
-
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
-   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_tau/
+   --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
+   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask_format_void/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask_format_void/
    --save-interval 20
-   --save-retain-interval 40
-   --finetune
-   --start-rollout-id 0
-   --skip-eval-before-train True
+   --save-retain-interval 60
+   # --finetune
+   # --start-rollout-id 0
+   # --skip-eval-before-train False
 )
+
+# --finetune 的效果（参见 Megatron 的 checkpointing.py 第 1711 行）：
+# 只加载模型权重，跳过 optimizer 和 lr scheduler 的状态恢复
+# iteration 从 0 重新开始，不会接着 math 的 iteration 继续计数
 
 ROLLOUT_ARGS=(
-   --prompt-data ${ROOT_DIR}/tau-bench/retail_train_tasks.jsonl
-   --input-key index
+   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
+   --input-key prompt
+   --label-key reward_model
+   --apply-chat-template
    --rollout-shuffle
-   --num-rollout 500
+   --num-rollout 1000
+   --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
-   --rollout-max-context-len 131072
+   --n-samples-per-prompt 5
+   --rollout-max-response-len 2048
    --rollout-temperature 1
-   --global-batch-size ${GLOBAL_BATCH_SIZE}
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-   --balance-data
-   --save-debug-rollout-data "${ROLLOUT_DEBUG_DIR}/rollout_{rollout_id}.pt"
-)
 
-EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data retail-dev ${ROOT_DIR}/tau-bench/retail_dev_tasks.jsonl
+   # eval args
+   --eval-interval 25
+   # --eval-prompt-data nq_test ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
+   --eval-prompt-data nq_test ${ROOT_DIR}/ARLArena/datasets/data/searchR1_processed_direct/test_small.parquet
+   --eval-input-key prompt
+   --eval-label-key reward_model
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 1024
-   --eval-top-k 1
+
+   --save-debug-rollout-data "${ROLLOUT_DEBUG_DIR}/rollout_{rollout_id}.pt"
+
+   --global-batch-size ${GLOBAL_BATCH_SIZE}
+   --balance-data
 )
 
 PERF_ARGS=(
@@ -91,21 +94,25 @@ PERF_ARGS=(
    --context-parallel-size 1
    --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
+
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
+
+   # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 10240
 )
 
 GRPO_ARGS=(
    --advantage-estimator gspo
    --use-kl-loss
-   --kl-loss-coef 0.001
+   --kl-loss-coef 0.1
    --kl-loss-type low_var_kl
-   --entropy-coef 0.00
+   --entropy-coef 0.01
    --eps-clip 0.2
    --eps-clip-high 0.28
+
    # whether enabling TIS
    --use-tis
 )
@@ -114,12 +121,12 @@ OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
    --lr-decay-style constant
+   --weight-decay 0.01
+   --adam-beta1 0.9
+   --adam-beta2 0.98
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
-   --weight-decay 0.1
-   --adam-beta1 0.9
-   --adam-beta2 0.98
 )
 
 WANDB_ARGS=(
@@ -131,14 +138,13 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 8
-   --sglang-mem-fraction-static 0.8
+   # MoE related args
+   --rollout-num-gpus-per-engine ${NUM_GPUS}
+   --sglang-mem-fraction-static 0.7
    --sglang-ep-size 4
-   --sglang-max-total-tokens 1500000
-   --sglang-context-length 131072
-   --sglang-json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'
-   # If gemini API reports concurrency limit error, set this parameter to reduce the concurrency
-   # --sglang-server-concurrency 32
+   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   # --sglang-enable-dp-attention
+   # --sglang-dp-size 8
 )
 
 MISC_ARGS=(
@@ -150,49 +156,61 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
+
+   --distributed-timeout-minutes 60 
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_tau.generate
+   --custom-generate-function-path generate_with_search_tools_qwen_void.generate
+   --custom-rm-path generate_with_search_tools_qwen_void.reward_func
 
    # TIS-related args, recommended to enable when using TIS
    --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
    --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
 
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+# launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${PYTHONPATH}"
 export PYTHONPATH="${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${SCRIPT_DIR}:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_NVLS_ENABLE="${HAS_NVLINK}"
+export RAY_memory_usage_threshold=0.99
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=false
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
 export RAY_TMPDIR="/data1/ray_out"
 rm -rf "$RAY_TMPDIR"
 mkdir -p "$RAY_TMPDIR"
 
-# If you want more or less GPUs, change this parameter
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --temp-dir ${MODEL_ROOT}/ray_temp 
 
 # RUNTIME_ENV_JSON="{
 #   \"env_vars\": {
-#     \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
+#     \"PYTHONPATH\": \"${ROOT_DIR}/Megatron-LM/:${SCRIPT_DIR}\",
 #     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
 #   }
 # }"
 
+# ray job submit --address="http://127.0.0.1:8265" \
+#    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+#    -- python3 train.py \
+
+export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
 python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node ${NUM_GPUS} \
    --num-gpus-per-node ${NUM_GPUS} \
    --colocate \
+   --no-offload-train \
+   --no-offload-rollout \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
-   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${CUSTOM_ARGS[@]}

@@ -33,7 +33,7 @@ ROLLOUT_BATCH_SIZE=64
 GLOBAL_BATCH_SIZE=320
 
 ## v3 加大kl 0.1,答对但没有toolcall降到0.2
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_gspo_cold_then_mask_format_sft"
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_gspo_sft_light_80_mask_4k"
 ROLLOUT_DEBUG_DIR="${ROOT_DIR}/multi_stage_rl_log/${WANDB_GROUP}"
 
 
@@ -46,9 +46,9 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_sft_search/
-   --load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math_sft_search/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_search_strict_v3_gspo_cold_then_mask_format_sft/
+   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_search_light/
+   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_search_light/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_80_gspo_4k/
    --save-interval 20
    --save-retain-interval 60
    --finetune
@@ -65,11 +65,11 @@ ROLLOUT_ARGS=(
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 300
+   --num-rollout 500
    # --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 5
-   --rollout-max-response-len 2048
+   --rollout-max-response-len 4096
    --rollout-temperature 1
 
    # eval args
@@ -106,7 +106,7 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator gspo
    --use-kl-loss
-   --kl-loss-coef 0.1
+   --kl-loss-coef 0.15
    --kl-loss-type low_var_kl
    --entropy-coef 0.01
    --eps-clip 0.2
@@ -167,8 +167,13 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_search_tools_qwen.generate
-   --custom-rm-path generate_with_search_tools_qwen.reward_func
+   --custom-generate-function-path generate_with_search_tools_qwen_sft.generate
+   --custom-rm-path generate_with_search_tools_qwen_sft.reward_func
+
+   # Group-gated loss-mask: when >50% of a group has no real tool execution,
+   # zero out the loss_mask of the no-tool samples (they still count toward
+   # group-relative advantage). See no_tool_loss_mask_filter.py.
+   --dynamic-sampling-filter-path no_tool_loss_mask_filter.no_tool_loss_mask_filter
 
    # TIS-related args, recommended to enable when using TIS
    --custom-config-path examples/train_infer_mismatch_helper/mis.yaml

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 TAU_CONFIGS = {
     "env": "retail",  # Select between ["retail", "airline"]
     "agent": "tool-calling",  # Select between ["tool-calling", "act", "react", "few-shot"]
-    "user_model": "zai-org/GLM-4.7-Flash",  # Cheap Model for user simulator
+    "user_model": "zai-org/GLM-4.7-Flash",  # user simulator,"gpt-4o-mini-2024-07-18"
     "task_split": "train",  # Select between ["train", "test", "dev"] for retail
     "user_strategy": "llm",  # Select between ["llm", "react", "verify", "reflection"]
     "model_provider": "auto_router",  # Unused, required
@@ -55,11 +55,11 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
     """
     # Map tau-bench status to slime status
     status_mapping = {
-        Status.COMPLETED: "completed",
-        Status.TRUNCATED: "truncated",
-        Status.ABORTED: "aborted",
+        Status.COMPLETED: Sample.Status.COMPLETED,
+        Status.TRUNCATED: Sample.Status.TRUNCATED,
+        Status.ABORTED: Sample.Status.ABORTED,
     }
-    status = status_mapping.get(res.status)
+    status = status_mapping.get(res.status, Sample.Status.ABORTED)
 
     # Debug logging for response tracking
     logger.debug(
@@ -79,6 +79,7 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
         loss_mask=res.loss_mask,
         status=status,
         metadata=res.info,
+        rollout_log_probs=res.rollout_log_probs,
     )
 
     # Ensure response_length is set correctly

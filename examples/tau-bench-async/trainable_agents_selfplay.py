@@ -31,36 +31,145 @@ class ContextWindowManager:
     """
     Sliding window over multi-turn conversation history.
 
-    Keeps the full message list for token tracking / loss mask computation,
-    but exposes a truncated view (system prompt + last k turns) for SGLang
-    inference, preventing context-length overflow in long episodes.
+    Keeps ALL messages but compresses old observation content (tool/user responses)
+    outside the window to prevent context overflow while ensuring rollout and training
+    see exactly the same token sequence structure.
 
-    A "turn" is one agent→env/user exchange, i.e. a pair of:
+    A "turn" is one agent→env/user exchange, i.e.:
       (assistant message, tool/user response message)
-    The system prompt and first user message (initial observation) are
-    always included regardless of k.
+    The system prompt and first user message (initial observation) are always
+    included in full regardless of k.
+
+    Observations older than the last k turns are truncated to max_obs_chars
+    characters. If the total token count still exceeds max_tokens, the oldest
+    out-of-window observations are further aggressively truncated until it fits.
+
+    IMPORTANT: both rollout inference and training token-delta computation must
+    call all_messages() with the same tokenizer so they see the identical token
+    sequence, keeping rollout_log_probs and train_log_probs aligned for TIS.
     """
 
-    def __init__(self, system_msg: dict, initial_user_msg: dict, k: int = 10):
+    def __init__(
+        self,
+        system_msg: dict,
+        initial_user_msg: dict,
+        k: int = 10,
+        max_obs_chars: int = 300,
+        max_tokens: int = 30000,
+    ):
         self.k = k
-        # Fixed prefix: [system, initial_user]
+        self.max_obs_chars = max_obs_chars
+        self.max_tokens = max_tokens
+        # Fixed prefix: [system, initial_user] — never compressed
         self.prefix: list[dict] = [system_msg, initial_user_msg]
-        # All messages after the prefix, grouped as flat list
-        # Each "turn" appends 2 messages: assistant + env/user response
+        # All messages after the prefix
         self.history: list[dict] = []
+        # Cached compressed view, invalidated on each append
+        self._cached_messages: list[dict] | None = None
 
     def append(self, msg: dict) -> None:
-        """Append a single message to history."""
+        """Append a single message to history and invalidate the cache."""
         self.history.append(msg)
+        self._cached_messages = None
 
-    def windowed_messages(self) -> list[dict]:
-        """Return prefix + last k*2 messages (k agent turns + k env responses)."""
-        cutoff = self.k * 2
-        return self.prefix + self.history[-cutoff:] if len(self.history) > cutoff else self.prefix + self.history
+    def all_messages(self, tokenizer=None) -> list[dict]:
+        """Return prefix + history with out-of-window observations compressed.
 
-    def all_messages(self) -> list[dict]:
-        """Return the complete untruncated message list (for token tracking)."""
-        return self.prefix + self.history
+        This is the single consistent view used for BOTH rollout inference and
+        training token-delta computation. When tokenizer is provided, further
+        truncates old observations until the total token count is below max_tokens.
+
+        Assistant messages are never compressed.
+        """
+        if self._cached_messages is not None and tokenizer is None:
+            return self._cached_messages
+
+        messages = self.prefix + self._compressed_history()
+
+        if tokenizer is not None:
+            messages = self._apply_token_budget(messages, tokenizer)
+            self._cached_messages = messages
+        return messages
+
+    def _compressed_history(self) -> list[dict]:
+        """Apply soft window-based compression: truncate old tool/user obs to max_obs_chars."""
+        assistant_indices = [i for i, m in enumerate(self.history) if m["role"] == "assistant"]
+
+        if len(assistant_indices) <= self.k:
+            return list(self.history)
+
+        window_start_idx = assistant_indices[len(assistant_indices) - self.k]
+
+        result = []
+        for i, msg in enumerate(self.history):
+            if i < window_start_idx and msg["role"] in ("tool", "user"):
+                content = msg["content"]
+                if len(content) > self.max_obs_chars:
+                    content = content[:self.max_obs_chars] + "..."
+                result.append({**msg, "content": content})
+            else:
+                result.append(msg)
+        return result
+
+    def _apply_token_budget(self, messages: list[dict], tokenizer) -> list[dict]:
+        """Hard budget enforcement: further shrink out-of-window obs until token count fits.
+
+        Iteratively halves the character budget for the oldest compressible messages
+        until the rendered token count is below self.max_tokens.  Assistant messages
+        and the prefix are never modified.
+        """
+        def count_tokens(msgs: list[dict]) -> int:
+            text = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
+            return len(tokenizer.encode(text, add_special_tokens=False))
+
+        if count_tokens(messages) <= self.max_tokens:
+            return messages
+
+        # Find indices of compressible messages (out-of-window tool/user obs)
+        # prefix has len(self.prefix) entries; history entries start after that
+        prefix_len = len(self.prefix)
+        assistant_indices_in_msgs = [
+            i for i, m in enumerate(messages[prefix_len:]) if m["role"] == "assistant"
+        ]
+        if len(assistant_indices_in_msgs) > self.k:
+            window_start = prefix_len + assistant_indices_in_msgs[len(assistant_indices_in_msgs) - self.k]
+        else:
+            window_start = prefix_len
+
+        compressible = [
+            i for i in range(prefix_len, window_start)
+            if messages[i]["role"] in ("tool", "user")
+        ]
+
+        if not compressible:
+            logger.warning(
+                "Context still exceeds max_tokens=%d after soft compression and no "
+                "further compressible messages remain. Returning as-is.",
+                self.max_tokens,
+            )
+            return messages
+
+        messages = [m.copy() for m in messages]
+        char_budget = self.max_obs_chars
+
+        while count_tokens(messages) > self.max_tokens and char_budget > 20:
+            char_budget = max(20, char_budget // 2)
+            for i in compressible:
+                content = messages[i]["content"]
+                if len(content) > char_budget:
+                    messages[i]["content"] = content[:char_budget] + "..."
+
+        if count_tokens(messages) > self.max_tokens:
+            logger.warning(
+                "Context exceeds max_tokens=%d even after aggressive compression "
+                "(char_budget=%d). This turn will likely be rejected by SGLang.",
+                self.max_tokens,
+                char_budget,
+            )
+
+        return messages
 
 
 class Status(Enum):
@@ -79,6 +188,7 @@ class InteractionResult:
     loss_mask: list[int] | None = None
     tokens: int | None = None
     status: Status = Status.COMPLETED
+    rollout_log_probs: list[float] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +211,7 @@ class SGLangUserSimulationEnv:
       - ...
     """
 
-    def __init__(self, tokenizer: AutoTokenizer, url: str, sampling_params: dict[str, Any]) -> None:
+    def __init__(self, tokenizer: AutoTokenizer, url: str, sampling_params: dict[str, Any], k: int = 6) -> None:
         self.tokenizer = tokenizer
         self.url = url
         # Use a separate, calmer sampling config: shorter responses, lower temperature.
@@ -110,6 +220,8 @@ class SGLangUserSimulationEnv:
             "temperature": 0.7,
             "max_new_tokens": 256,
         }
+        self.k = k  # keep last k user/assistant turn pairs in history
+        self._system_msg: dict[str, Any] | None = None
         self.messages: list[dict[str, Any]] = []
 
     def _build_system_prompt(self, instruction: str | None) -> str:
@@ -130,20 +242,27 @@ class SGLangUserSimulationEnv:
         )
 
     async def reset(self, instruction: str | None = None) -> str:
-        self.messages = [
-            {"role": "system", "content": self._build_system_prompt(instruction)},
-            {"role": "user", "content": "Hi! How can I help you today?"},
-        ]
+        self._system_msg = {"role": "system", "content": self._build_system_prompt(instruction)}
+        self.messages = [{"role": "user", "content": "Hi! How can I help you today?"}]
         return await self._generate()
 
     async def step(self, agent_message: str) -> str:
         """Called each time the agent sends a message to the user."""
-        self.messages.append({"role": "user", "content": agent_message})
+        # Strip <think>...</think> blocks from agent message to avoid ballooning context
+        import re
+        clean_message = re.sub(r"<think>.*?</think>", "", agent_message, flags=re.DOTALL).strip()
+        self.messages.append({"role": "user", "content": clean_message or agent_message})
         return await self._generate()
+
+    def _windowed_messages(self) -> list[dict[str, Any]]:
+        """Return system msg + last k*2 messages (k user turns + k assistant turns)."""
+        cutoff = self.k * 2
+        history = self.messages[-cutoff:] if len(self.messages) > cutoff else self.messages
+        return [self._system_msg] + history
 
     async def _generate(self) -> str:
         text = self.tokenizer.apply_chat_template(
-            self.messages,
+            self._windowed_messages(),
             tokenize=False,
             add_generation_prompt=True,
             # No tools — user sim is plain chat
@@ -229,8 +348,14 @@ class SelfPlayAgentMixin:
         loss_masks: list[int],
         prompt_token_ids: list[int],
         response_token_ids: list[int],
+        rollout_log_probs: list[float] | None = None,
+        agent_turns: int = 0,
+        tool_call_turns: int = 0,
     ) -> InteractionResult:
         res.reward = total_reward
+        info["has_tool_call"] = tool_call_turns > 0
+        info["num_turns"] = agent_turns
+        info["tool_call_turn_frac"] = tool_call_turns / agent_turns if agent_turns > 0 else 0.0
         res.info = info
         res.messages = messages
         res.loss_mask = loss_masks
@@ -239,6 +364,7 @@ class SelfPlayAgentMixin:
             [msg.get("content", "") for msg in messages if msg["role"] == "assistant"]
         )
         res.response_length = len(loss_masks)
+        res.rollout_log_probs = rollout_log_probs  # always a list, even if empty (never None)
         return res
 
     async def asolve(
@@ -271,11 +397,16 @@ class SelfPlayAgentMixin:
         )
         initial_obs = await user_sim.reset(instruction=env.task.instruction)
 
-        # Build initial agent conversation with sliding window manager
+        # Build initial agent conversation with sliding window manager.
+        # max_tokens budget = model context length minus response headroom, so the
+        # prompt fed to SGLang never exceeds the model's context window.
+        _max_response = getattr(rollout_args, "rollout_max_response_len", 1024)
+        _model_ctx = getattr(rollout_args, "rollout_max_context_len", None) or 32768
         ctx = ContextWindowManager(
             system_msg={"role": "system", "content": self.wiki},
             initial_user_msg={"role": "user", "content": initial_obs},
             k=context_window_k,
+            max_tokens=_model_ctx - _max_response,
         )
 
         prompt_text = state.tokenizer.apply_chat_template(
@@ -286,26 +417,32 @@ class SelfPlayAgentMixin:
 
         loss_masks: list[int] = []
         response_token_ids: list[int] = []
+        rollout_log_probs: list[float] = []
         total_reward = 0.0
         info: dict[str, Any] = EnvInfo(task=env.task, source="user").model_dump()
         env_response: EnvResponse | None = None
+        agent_turns = 0
+        tool_call_turns = 0
 
         res = InteractionResult(prompt=prompt_text, reward=0, messages=[], info={})
 
         for _ in range(max_num_steps):
             # --- Policy model (agent) generates next action ---
-            # Use windowed_messages() for inference to avoid context overflow.
-            # all_messages() is used for token delta tracking (complete history).
+            # all_messages(tokenizer) applies both soft window compression AND hard
+            # token-budget enforcement, returning a single consistent view used for
+            # both rollout inference and token-delta computation (TIS alignment).
+            current_messages = ctx.all_messages(state.tokenizer)
             text_input = state.tokenizer.apply_chat_template(
-                ctx.windowed_messages(), tokenize=False, add_generation_prompt=True, tools=self.tools_info
+                current_messages, tokenize=False, add_generation_prompt=True, tools=self.tools_info
             )
             text_input = self._reformulate_tool_call(text_input)
-            output = await self._call_llm(agent_url, {"text": text_input, "sampling_params": sampling_params})
+            output = await self._call_llm(agent_url, {"text": text_input, "sampling_params": sampling_params, "return_logprob": True})
 
             if output["meta_info"]["finish_reason"]["type"] == "abort":
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs,
+                    agent_turns=agent_turns, tool_call_turns=tool_call_turns,
                 )
 
             response = output["text"]
@@ -319,25 +456,39 @@ class SelfPlayAgentMixin:
                     logger.warning(f"Tool parse failed: {openai_result['error']}")
                     res.status = Status.ABORTED
                     return self._build_final_result(
-                        res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids
+                        res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs,
+                        agent_turns=agent_turns, tool_call_turns=tool_call_turns,
                     )
                 parsed = openai_result["parsed_result"]
             except Exception as e:
                 logger.warning(f"Tool parse exception: {e}")
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs,
+                    agent_turns=agent_turns, tool_call_turns=tool_call_turns,
                 )
 
-            # Track agent tokens (loss_mask=1) using full history
+            # Track agent tokens (loss_mask=1). Use all_messages(tokenizer) so the
+            # token delta is computed on the same compressed context used for rollout.
             ctx.append({"role": "assistant", "content": response})
-            agent_token_ids, agent_loss_mask = self._get_token_delta(state.tokenizer, ctx.all_messages())
+            messages_with_assistant = ctx.all_messages(state.tokenizer)
+            agent_token_ids, agent_loss_mask = self._get_token_delta(state.tokenizer, messages_with_assistant)
             response_token_ids.extend(agent_token_ids)
             loss_masks.extend(agent_loss_mask)
+            # Collect agent log probs for TIS; pad to match token count if SGLang didn't return them
+            step_log_probs = (
+                [item[0] for item in output["meta_info"].get("output_token_logprobs", [])]
+                if output.get("meta_info") else []
+            )
+            if len(step_log_probs) < len(agent_token_ids):
+                step_log_probs += [0.0] * (len(agent_token_ids) - len(step_log_probs))
+            rollout_log_probs.extend(step_log_probs[:len(agent_token_ids)])
 
             # Build action
             agent_content, calls = parsed["normal_text"], parsed["calls"]
+            agent_turns += 1
             if calls:
+                tool_call_turns += 1
                 if len(calls) > 1:
                     logger.debug("Multiple tool calls; using first.")
                 tool_call = calls[0]
@@ -355,7 +506,8 @@ class SelfPlayAgentMixin:
                     logger.warning(f"User sim step failed: {e}")
                     res.status = Status.ABORTED
                     return self._build_final_result(
-                        res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids
+                        res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs,
+                        agent_turns=agent_turns, tool_call_turns=tool_call_turns,
                     )
 
                 done = STOP_SIGNAL in user_response
@@ -386,7 +538,8 @@ class SelfPlayAgentMixin:
                     logger.warning(f"Tool execution failed: {e}")
                     res.status = Status.ABORTED
                     return self._build_final_result(
-                        res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids
+                        res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs,
+                        agent_turns=agent_turns, tool_call_turns=tool_call_turns,
                     )
 
                 ctx.append({
@@ -395,10 +548,12 @@ class SelfPlayAgentMixin:
                     "content": env_response.observation,
                 })
 
-            # Track env/tool tokens (loss_mask=0) using full history
-            env_token_ids, env_loss_mask = self._get_token_delta(state.tokenizer, ctx.all_messages())
+            # Track env/tool/user tokens (loss_mask=0). Same compressed context for consistency.
+            env_token_ids, env_loss_mask = self._get_token_delta(state.tokenizer, ctx.all_messages(state.tokenizer))
             response_token_ids.extend(env_token_ids)
             loss_masks.extend(env_loss_mask)
+            # Pad rollout_log_probs with 0 for non-agent tokens (loss_mask=0, TIS ignores them)
+            rollout_log_probs.extend([0.0] * len(env_token_ids))
 
             total_reward = env_response.reward
             info = {**info, **env_response.info.model_dump()}
@@ -411,7 +566,8 @@ class SelfPlayAgentMixin:
             res.status = Status.TRUNCATED
 
         return self._build_final_result(
-            res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids
+            res, total_reward, info, ctx.all_messages(), loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs,
+            agent_turns=agent_turns, tool_call_turns=tool_call_turns,
         )
 
 

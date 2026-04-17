@@ -35,7 +35,7 @@ ROLLOUT_BATCH_SIZE=64
 # rollout-only 模式下 global-batch-size 不影响训练，但框架仍需要此参数
 GLOBAL_BATCH_SIZE=320
 
-ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/rollout_only_Qwen3-30B-A3B"
+ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/rollout_only_search_Qwen3-30B-A3B"
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  # <<<------  which GPUs to use, directly fill here
 CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
@@ -56,7 +56,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train_filtered_conf.parquet
+   --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
    --input-key prompt
    --label-key reward_model
    --apply-chat-template
@@ -96,7 +96,7 @@ PERF_ARGS=(
 SGLANG_ARGS=(
    # MoE related args
    --rollout-num-gpus-per-engine ${NUM_GPUS}
-   --sglang-mem-fraction-static 0.65
+   --sglang-mem-fraction-static 0.8
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )

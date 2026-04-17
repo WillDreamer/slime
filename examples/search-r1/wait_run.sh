@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # List the PIDs you want to wait for
-PIDS=(2493478 2495767)
+PIDS=(201403 201404)
 
 echo "Waiting for PIDs to terminate: ${PIDS[@]}"
 
@@ -22,7 +22,7 @@ while true; do
     fi
 
     echo "Still running: ${alive[@]} ... checking again in 5s"
-    sleep 50
+    sleep 120
 done
 
 # # ----------------------------
@@ -31,4 +31,4 @@ done
 # echo "Starting next job..."
 # bash /data1/xw27/agent/ARLArena/examples/math_trainer/train_grpo_s_cispo.sh
 
-bash /data1/whx/slime/examples/tau-bench/run_qwen3_30B.sh
+bash /data1/whx/slime/examples/search-r1/run_qwen3_30b_a3b_seq_gspo.sh

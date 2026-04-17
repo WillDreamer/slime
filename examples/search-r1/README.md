@@ -307,3 +307,17 @@ rm -rf /root/.*
 - Check if the server is running: `lsof -i :8000`
 - Verify GPU availability: `nvidia-smi`
 - Check logs for any error messages
+
+
+----------------
+## Final version
+```
+bash /data1/whx/slime/examples/search-r1/run_qwen3_30b_a3b_seq_gspo.sh
+```
+
+## SFT
+```
+1. slime/examples/search-r1/run_qwen3_30b_a3b_rollout_only.sh
+2. slime/examples/search-r1/filter_rollout_data.py
+3. slime/examples/search-r1/run_qwen3_30b_a3b_sft.sh
+```

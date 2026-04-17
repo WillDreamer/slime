@@ -3,9 +3,9 @@ Filter rollout data by reward threshold.
 
 Usage:
     python filter_rollout_data.py \
-        --input-dir /data2/whx/rollout_only_Qwen3-30B-A3B/ \
-        --output-dir /data2/whx/rollout_only_Qwen3-30B-A3B/filtered/ \
-        --min-reward 0.4 \
+        --input-dir /data2/whx/rollout_only_search_Qwen3-30B-A3B \
+        --output-dir /data2/whx/rollout_only_search_Qwen3-30B-A3B_filtered \
+        --min-reward 0.8 \
         --batch-size 64
 """
 
@@ -76,6 +76,13 @@ def filter_samples(files, min_reward):
 
             # Filter: reward >= min_reward and not failed/aborted
             if reward >= min_reward and status not in ("failed", "aborted"):
+                # Skip samples whose loss_mask is all-zeros (e.g. direct-answer samples
+                # masked out by the anti-collapse mask_no_tool_call_warmup mechanism).
+                # Such samples contribute zero loss during SFT training.
+                loss_mask = sample.get("loss_mask")
+                if loss_mask is not None and sum(loss_mask) == 0:
+                    reward_bins["zero_loss_mask"] += 1
+                    continue
                 all_samples.append(sample)
 
     return all_samples, total_count, reward_bins
