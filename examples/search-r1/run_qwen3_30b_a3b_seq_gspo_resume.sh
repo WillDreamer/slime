@@ -31,9 +31,8 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
 ROLLOUT_BATCH_SIZE=64
 GLOBAL_BATCH_SIZE=320
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_strict_v3_gspo_cold_then_mask_format_void_resume"
-
-ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/${WANDB_GROUP}"
+WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_gspo_sft_light_80_mask_4k_resume"
+ROLLOUT_DEBUG_DIR="${ROOT_DIR}/multi_stage_rl_log/${WANDB_GROUP}"
 
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  # <<<------  which GPUs to use, directly fill here
@@ -46,9 +45,9 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --ref-load ${MODEL_ROOT}/Qwen3-30B-A3B_base_math/
-   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask_format_void/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask_format_void/
+   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_search_light/
+   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_80_gspo_4k/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_80_gspo_4k/
    --save-interval 20
    --save-retain-interval 60
    # --finetune
@@ -66,11 +65,11 @@ ROLLOUT_ARGS=(
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 1000
-   --override-opt-param-scheduler
+   --num-rollout 500
+   # --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 5
-   --rollout-max-response-len 2048
+   --rollout-max-response-len 4096
    --rollout-temperature 1
 
    # eval args
@@ -101,13 +100,13 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 10240
+   --max-tokens-per-gpu 8192 
 )
 
 GRPO_ARGS=(
    --advantage-estimator gspo
    --use-kl-loss
-   --kl-loss-coef 0.1
+   --kl-loss-coef 0.15
    --kl-loss-type low_var_kl
    --entropy-coef 0.01
    --eps-clip 0.2
@@ -140,11 +139,18 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    # MoE related args
    --rollout-num-gpus-per-engine ${NUM_GPUS}
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.6
    --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    # --sglang-enable-dp-attention
    # --sglang-dp-size 8
+)
+
+FAULT_TOLERANCE_ARGS=(
+   --use-fault-tolerance
+   --rollout-health-check-interval 30
+   --rollout-health-check-timeout 60
+   --rollout-health-check-first-wait 120
 )
 
 MISC_ARGS=(
@@ -161,8 +167,13 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_search_tools_qwen_void.generate
-   --custom-rm-path generate_with_search_tools_qwen_void.reward_func
+   --custom-generate-function-path generate_with_search_tools_qwen_sft.generate
+   --custom-rm-path generate_with_search_tools_qwen_sft.reward_func
+
+   # Group-gated loss-mask: when >50% of a group has no real tool execution,
+   # zero out the loss_mask of the no-tool samples (they still count toward
+   # group-relative advantage). See no_tool_loss_mask_filter.py.
+   --dynamic-sampling-filter-path no_tool_loss_mask_filter.no_tool_loss_mask_filter
 
    # TIS-related args, recommended to enable when using TIS
    --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
@@ -197,6 +208,9 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disab
 #    -- python3 train.py \
 
 export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
+
+LOG_FILE="${ROOT_DIR}/${WANDB_GROUP}.log"
+echo "Logging to ${LOG_FILE}"
 python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node ${NUM_GPUS} \
@@ -213,4 +227,6 @@ python3 train.py \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${CUSTOM_ARGS[@]}
+   ${CUSTOM_ARGS[@]} \
+   ${FAULT_TOLERANCE_ARGS[@]} \
+   2>&1 | tee "${LOG_FILE}"

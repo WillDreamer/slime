@@ -48,8 +48,8 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_tau_sft/
+   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_80_gspo_4k/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_math_search_sft_tau/
    --save-interval 20
    --save-retain-interval 40
    --finetune
@@ -63,7 +63,7 @@ SFT_ARGS=(
    --input-key data
    --rollout-global-dataset
    --rollout-shuffle
-   --num-epoch 3
+   --num-epoch 1
    --rollout-batch-size 64
    --global-batch-size 64
 
