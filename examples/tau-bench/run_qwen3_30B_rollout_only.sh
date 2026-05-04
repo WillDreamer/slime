@@ -53,7 +53,7 @@ ROLLOUT_ARGS=(
    --prompt-data ${ROOT_DIR}/tau-bench/retail_train_tasks.jsonl
    --input-key index
    --rollout-shuffle
-   --num-rollout 500
+   --num-rollout 300
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 8
    --rollout-max-response-len 1024

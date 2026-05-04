@@ -105,7 +105,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             _log(f"model loaded, loaded_rollout_id={loaded_rollout_id}")
 
-            start_rollout_id = loaded_rollout_id + 1
+            start_rollout_id = loaded_rollout_id
 
             if role == "critic":
                 if self.args.offload_train:
@@ -544,7 +544,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        save(rollout_id + 1, self.model, self.optimizer, self.opt_param_scheduler)
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)

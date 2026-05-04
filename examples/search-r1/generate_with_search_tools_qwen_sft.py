@@ -316,7 +316,7 @@ class MessageContextWindowManager:
     @staticmethod
     def _format_tool_response(search_result: str) -> str:
         return (
-            f"\n<|im_start|>tool\n<tool_response>\n{search_result}\n</tool_response><|im_end|>\n"
+            f"\n<|im_start|>user\n<tool_response>\n{search_result}\n</tool_response><|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
 
@@ -324,7 +324,7 @@ class MessageContextWindowManager:
     def _format_tool_response_for_tokens(search_result: str) -> str:
         return (
             f"\n"
-            f"<|im_start|>tool\n<tool_response>\n{search_result}\n</tool_response><|im_end|>\n"
+            f"<|im_start|>user\n<tool_response>\n{search_result}\n</tool_response><|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
 

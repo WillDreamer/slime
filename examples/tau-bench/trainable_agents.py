@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -8,13 +9,79 @@ from openai_tool_adapter import create_openai_adapter
 from tau_bench.agents.base import Agent
 from tau_bench.agents.tool_calling_agent import RESPOND_ACTION_NAME, ToolCallingAgent
 from tau_bench.types import Action, RunConfig
-from transformers import AutoTokenizer
-
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
+
+
+# Format-check regexes for the per-turn shape we want every assistant turn to take:
+#   (A) tool-call turn:  <think>...</think><tool_call>...</tool_call>
+#   (B) respond turn:    <think>...</think>{plain natural-language reply}
+# Anything else (no <think>, mismatched tags, garbage / repetition / template
+# soup tail after the answer text, double <think> blocks, etc.) is "format-bad"
+# and the trajectory pays an additive FORMAT_BAD_PENALTY on its task reward.
+_FORMAT_TOOLCALL_RE = re.compile(
+    r"\A\s*<think>(?!.*<think>).*?</think>\s*<tool_call>(?!.*<tool_call>).*?</tool_call>\s*\Z",
+    re.DOTALL,
+)
+_FORMAT_THINK_PREFIX_RE = re.compile(
+    r"\A\s*<think>(?!.*<think>).*?</think>(?P<after>.*)\Z",
+    re.DOTALL,
+)
+# Additive penalties subtracted from total_reward when any assistant turn is
+# format-bad. Weakened so format noise can't dominate the task signal:
+#   - Successful (raw>0): pay 0.1 — light tap, still leaves +0.9 reward.
+#   - Failed (raw==0): no penalty. We rely on the task gradient (and SFT) for
+#     format learning; double-charging failures was hurting more than helping.
+FORMAT_BAD_PENALTY_SUCCESS = 0.1
+FORMAT_BAD_PENALTY_FAIL = 0.0
+
+# Think length penalty is DISABLED. Earlier ablation showed it created a
+# perverse gradient ("failed + long think" got -0.3, worse than truncation),
+# pulling the model away from the SFT init's long-CoT distribution and
+# collapsing tau-bench planning quality. We still measure avg_think_chars
+# below for wandb monitoring, but the penalty term is forced to 0.
+THINK_BUDGET_PER_TURN_CHARS = 500
+THINK_PENALTY_PER_OVERAGE_CHAR = 0.0
+THINK_PENALTY_CAP = 0.0
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _assistant_turn_format_ok(content: str) -> bool:
+    """A single assistant turn is well-formed iff its raw text matches one of:
+        <think>...</think><tool_call>...</tool_call>               (tool turn)
+        <think>...</think>{plain text without XML markup garbage}  (respond turn)
+    Reject double-<think>, double-<tool_call>, leftover <|im_start|>/<|im_end|>/
+    <tool_response> markup in the natural-language tail, etc.
+    """
+    if not content:
+        return False
+    if _FORMAT_TOOLCALL_RE.fullmatch(content):
+        return True
+    m = _FORMAT_THINK_PREFIX_RE.fullmatch(content)
+    if m is None:
+        return False
+    after = m.group("after")
+    for bad in ("<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+                "<|im_start|>", "<|im_end|>", "<think>", "</think>"):
+        if bad in after:
+            return False
+    return True
+
+
+def _trajectory_format_ok(messages: list[dict[str, Any]]) -> tuple[bool, int, int]:
+    """Returns (all_ok, num_assistant_turns, num_bad_turns)."""
+    n_turns = 0
+    n_bad = 0
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        n_turns += 1
+        if not _assistant_turn_format_ok(msg.get("content", "")):
+            n_bad += 1
+    return (n_bad == 0 and n_turns > 0), n_turns, n_bad
 
 
 class Status(Enum):
@@ -155,24 +222,208 @@ class TrainableAgentMixin:
         """
         return [{"role": "system", "content": self.wiki}, {"role": "user", "content": obs}]
 
-    def _prepare_prompt_tokens(self, state: GenerateState, messages: list[dict[str, Any]]) -> tuple[str, list[int]]:
-        """
-        Prepare prompt text and tokenize it.
-
-        Args:
-            state: GenerateState instance with tokenizer
-            messages: Conversation messages
-
-        Returns:
-            Tuple of (prompt_text, prompt_token_ids)
-        """
-        prompt_text = state.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, tools=self.tools_info
+    def _render_messages_text(
+        self,
+        state: GenerateState,
+        messages: list[dict[str, Any]],
+        add_generation_prompt: bool,
+    ) -> str:
+        """Render messages via apply_chat_template + tau-bench tool-instruction patch."""
+        text = state.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=self.tools_info,
         )
-        # Reformulate tool call instruction for tau-bench
-        prompt_text = self._reformulate_tool_call(prompt_text)
+        return self._reformulate_tool_call(text)
+
+    def _prepare_prompt_tokens(self, state: GenerateState, messages: list[dict[str, Any]]) -> tuple[str, list[int]]:
+        """Render the initial prompt and return (text, token_ids)."""
+        prompt_text = self._render_messages_text(state, messages, add_generation_prompt=True)
         prompt_token_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         return prompt_text, prompt_token_ids
+
+    @staticmethod
+    def _find_subsequence_starts(haystack: list[int], needle: list[int]) -> list[int]:
+        """Return all start positions of `needle` in `haystack`, non-overlapping greedy."""
+        if not needle:
+            return []
+        out: list[int] = []
+        nl = len(needle)
+        i = 0
+        while i <= len(haystack) - nl:
+            if haystack[i:i + nl] == needle:
+                out.append(i)
+                i += nl
+            else:
+                i += 1
+        return out
+
+    def _build_training_tensor(
+        self,
+        state: GenerateState,
+        messages: list[dict[str, Any]],
+        prompt_token_ids: list[int],
+        turn_samples: list[dict[str, Any]],
+        im_end_id: int,
+        asst_prompt_token_ids: list[int],
+    ) -> tuple[list[int], list[int], list[float], str]:
+        """Render the full trajectory once and rebuild (response, mask, logprob).
+
+        Strategy:
+          1. apply_chat_template(messages, ag=False) → final canonical text/tokens.
+             This is what slime backprops on; per-token prefix at training time
+             matches what each turn saw at sampling time (Qwen3's last_query_index
+             logic strips historical <think> after the latest real user turn).
+          2. Locate every `<|im_start|>assistant\\n` boundary in the rendered tokens
+             and pair the i-th boundary with turn_samples[i].
+          3. For each pair, the rendered span is one of:
+               a) full sample (think preserved — turn is after last_query_index):
+                  span == sampled_token_ids → mask=1, use sampled logprobs as-is
+               b) post-think suffix (think stripped — turn is before last_query_index):
+                  span == sampled_token_ids[k:] where k counts <think>...</think>\\n\\n
+                  → mask=1 only on surviving tokens, with their post-think logprobs
+               c) neither (e.g., format-bad output, length-truncated final turn whose
+                  </think> never closed, or whitespace de-canonicalization):
+                  log a warning and leave mask=0 for the turn
+
+        The trailing <|im_end|> of every well-formed turn is force-set to mask=1
+        with logprob=0.0 so the policy keeps learning to terminate turns.
+        """
+        if not turn_samples:
+            return [], [], [], ""
+
+        final_text = self._render_messages_text(state, messages, add_generation_prompt=False)
+        final_token_ids = state.tokenizer(final_text, add_special_tokens=False)["input_ids"]
+
+        if final_token_ids[:len(prompt_token_ids)] != prompt_token_ids:
+            logger.warning(
+                "Final render does not start with the cached prompt prefix; "
+                "tools list or system content drifted between renders."
+            )
+
+        response_token_ids = list(final_token_ids[len(prompt_token_ids):])
+        loss_masks = [0] * len(response_token_ids)
+        rollout_log_probs = [0.0] * len(response_token_ids)
+
+        asst_starts = self._find_subsequence_starts(final_token_ids, asst_prompt_token_ids)
+        # Each start[i] points at the position of `<|im_start|>` itself; the
+        # assistant content begins +len(asst_prompt_token_ids) tokens later.
+        asst_content_starts = [s + len(asst_prompt_token_ids) for s in asst_starts]
+
+        # If the trajectory aborted/length-truncated mid-assistant, messages[-1] is
+        # the broken assistant turn. Its rendered form may include a synthetic
+        # `<think>\\n\\n</think>\\n\\n` wrapper if `</think>` never closed, which
+        # shifts every token in the span and breaks alignment. Skip its training
+        # signal entirely rather than backprop on garbage.
+        last_msg_is_assistant = bool(messages) and messages[-1].get("role") == "assistant"
+
+        if len(asst_content_starts) != len(turn_samples):
+            logger.warning(
+                f"Assistant boundary count {len(asst_content_starts)} != turn_samples count "
+                f"{len(turn_samples)}; pairing by position with the smaller of the two."
+            )
+
+        n_pairs = min(len(asst_content_starts), len(turn_samples))
+        for span_idx in range(n_pairs):
+            sample = turn_samples[span_idx]
+            sampled_tokens: list[int] = sample["sampled_token_ids"]
+            sampled_logprobs: list[float] = sample["sampled_log_probs"]
+            response_text: str = sample["response_text"]
+
+            if last_msg_is_assistant and span_idx == n_pairs - 1:
+                # Skip the broken trailing turn — its render is unreliable.
+                continue
+
+            content_start = asst_content_starts[span_idx]
+            end = content_start
+            while end < len(final_token_ids) and final_token_ids[end] != im_end_id:
+                end += 1
+            if end >= len(final_token_ids):
+                logger.warning(f"Turn {span_idx}: no <|im_end|> after asst_start; skipping")
+                continue
+
+            span_tokens = final_token_ids[content_start:end]
+            resp_content_start = content_start - len(prompt_token_ids)
+            resp_im_end_pos = end - len(prompt_token_ids)
+            if resp_content_start < 0 or resp_im_end_pos >= len(response_token_ids):
+                logger.warning(f"Turn {span_idx}: response indices out of range; skipping")
+                continue
+
+            # (a) think preserved — direct match
+            if span_tokens == sampled_tokens:
+                for off, lp in enumerate(sampled_logprobs):
+                    loss_masks[resp_content_start + off] = 1
+                    rollout_log_probs[resp_content_start + off] = lp
+                loss_masks[resp_im_end_pos] = 1
+                continue
+
+            # (b) think stripped — try post-think suffix match
+            end_tag = response_text.find("</think>")
+            if end_tag >= 0:
+                after_close = end_tag + len("</think>")
+                while after_close < len(response_text) and response_text[after_close] == "\n":
+                    after_close += 1
+                stripped_prefix_text = response_text[:after_close]
+                stripped_prefix_tokens = state.tokenizer(
+                    stripped_prefix_text, add_special_tokens=False
+                )["input_ids"]
+                n_stripped = len(stripped_prefix_tokens)
+                if n_stripped <= len(sampled_tokens):
+                    post_think_tokens = sampled_tokens[n_stripped:]
+                    post_think_logprobs = sampled_logprobs[n_stripped:]
+                    if span_tokens == post_think_tokens:
+                        for off, lp in enumerate(post_think_logprobs):
+                            loss_masks[resp_content_start + off] = 1
+                            rollout_log_probs[resp_content_start + off] = lp
+                        loss_masks[resp_im_end_pos] = 1
+                        continue
+
+            # (c) neither — alignment failed; leave mask=0
+            logger.warning(
+                f"Turn {span_idx}: render/sample alignment failed "
+                f"(span_len={len(span_tokens)}, sampled_len={len(sampled_tokens)}); "
+                f"no training signal for this turn."
+            )
+
+        response_text_decoded = state.tokenizer.decode(response_token_ids) if response_token_ids else ""
+        return response_token_ids, loss_masks, rollout_log_probs, response_text_decoded
+
+    @staticmethod
+    def _build_verbose_response_text(messages: list[dict[str, Any]]) -> str:
+        """Render the post-prompt suffix of `messages` preserving every turn's
+        `<think>` block — saved to `res.response` for inspection only.
+
+        The canonical apply_chat_template render (used for training tensors)
+        strips historical `<think>` per Qwen3's last_query_index logic, so the
+        saved response text loses CoT for every turn before the final user
+        message. This helper bypasses the template and emits each message in
+        Qwen's exact wire format, leaving assistant content (which already
+        includes <think>...</think>) untouched.
+
+        messages[0] is system, messages[1] is the initial user; both render
+        into the prompt prefix. The response begins immediately after the
+        prompt's trailing `<|im_start|>assistant\\n`, so the first assistant
+        turn here is emitted *without* its own `<|im_start|>assistant\\n` —
+        same convention as the existing canonical-stripped response_text.
+        """
+        parts: list[str] = []
+        for i in range(2, len(messages)):
+            msg = messages[i]
+            role = msg.get("role")
+            content = msg.get("content", "") or ""
+            if role == "assistant":
+                if i == 2:
+                    parts.append(f"{content}<|im_end|>\n")
+                else:
+                    parts.append(f"<|im_start|>assistant\n{content}<|im_end|>\n")
+            elif role == "tool":
+                parts.append(
+                    f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
+                )
+            else:  # "user"
+                parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
+        return "".join(parts)
 
     async def asolve(
         self,
@@ -185,209 +436,262 @@ class TrainableAgentMixin:
         """
         Execute async agent-environment interaction for training.
 
-        This method extends the original Agent to support async interaction with LLM
-        server for reinforcement learning training. It maintains conversation history,
-        tracks tokens, and records metadata for training purposes.
+        Per turn we re-render the full message list via apply_chat_template
+        (so tool messages get the canonical `<|im_start|>user\\n<tool_response>...`
+        wrap, and Qwen3's last_query_index logic strips historical <think> blocks
+        once a real user turn arrives via the user simulator). The training
+        tensor is rebuilt at end-of-trajectory from the same final render, with
+        per-turn sampled logprobs aligned back onto the surviving tokens — see
+        `_build_training_tensor` for the alignment cases.
 
-        Args:
-            env: Tau-bench environment instance
-            rollout_args: Rollout configuration arguments
-            sampling_params: LLM sampling parameters
-            task_index: Specific task index to solve (optional)
-            max_num_steps: Maximum number of interaction steps
-
-        Returns:
-            InteractionResult containing the complete interaction trajectory
+        Trade-off vs. the prior string-concat path: a per-turn re-render costs
+        one tokenizer pass on a bounded message list, but in exchange the
+        rollout context exactly matches the SFT distribution and stops growing
+        the trajectory's <think> footprint after every RESPOND turn.
         """
-        # Initialize environment and state
         state = GenerateState(rollout_args)
         url = f"http://{rollout_args.sglang_router_ip}:" f"{rollout_args.sglang_router_port}/generate"
 
-        # Get initial environment state
-        obs, info = await self._initialize_environment(env, task_index)
+        im_end_id = state.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        # Tokenize the assistant prompt-prefix once for boundary scanning at
+        # tensor-build time. On Qwen3 this is [151644, 77091, 198].
+        asst_prompt_token_ids = state.tokenizer(
+            "<|im_start|>assistant\n", add_special_tokens=False
+        )["input_ids"]
 
-        # Build initial conversation
+        # Stop the moment the model closes a tool call OR ends the assistant
+        # turn. Qwen3-Base's generation_config sets eos=<|endoftext|> (151643),
+        # so sglang by default does NOT stop on <|im_end|> (151645). Without
+        # an explicit stop on <|im_end|>, a RESPOND-style reply (natural-
+        # language message to the user, no <tool_call>) burns through
+        # max_new_tokens after emitting its own <|im_end|> — the model keeps
+        # hallucinating a second <think> block past turn end.
+        stop_list = list(sampling_params.get("stop") or [])
+        if "</tool_call>" not in stop_list:
+            stop_list = stop_list + ["</tool_call>"]
+        stop_token_ids = list(sampling_params.get("stop_token_ids") or [])
+        if im_end_id not in stop_token_ids:
+            stop_token_ids = stop_token_ids + [im_end_id]
+        sampling_params = {
+            **sampling_params,
+            "stop": stop_list,
+            "stop_token_ids": stop_token_ids,
+            "no_stop_trim": True,
+        }
+
+        # env.reset triggers the user-simulator LLM call, which can raise
+        # transient network errors (httpcore.ReadError, etc.) that tau-bench's
+        # user.py retry loop does not catch. Guard it here so one flaky sample
+        # doesn't take down the whole asyncio.gather in generate_and_rm_group.
+        try:
+            obs, info = await self._initialize_environment(env, task_index)
+        except Exception as e:
+            logger.warning(f"env.reset failed for task {task_index}: {e.__class__.__name__}: {e}")
+            reset_info = {
+                "reset_error": str(e),
+                "num_turns": 0,
+                "num_tool_calls": 0,
+                "num_respond_turns": 0,
+                "num_length_trunc": 0,
+                "has_tool_call": 0,
+                "tool_call_turn_frac": 0.0,
+                "answer_correct": 0,
+                "env_done": 0,
+                "is_aborted": 1,
+            }
+            res = InteractionResult(prompt="", reward=0, messages=[], info=reset_info)
+            res.status = Status.ABORTED
+            return self._build_final_result(res, 0.0, reset_info, [], [], [], [], [])
+
         messages = self._build_initial_messages(obs)
         prompt_text, prompt_token_ids = self._prepare_prompt_tokens(state, messages)
 
-        # Initialize tracking variables
-        loss_masks = []
-        response_token_ids = []
-        rollout_log_probs = []
         total_reward = 0.0
 
-        # Initialize result
+        # Per-trajectory metrics — surfaced via info so slime's
+        # compute_metrics_from_samples auto-logs them to wandb.
+        num_turns = 0
+        num_tool_calls = 0
+        num_respond_turns = 0
+        num_length_trunc = 0
+
+        # Per-turn sample records for tensor reconstruction. We never use these
+        # to drive inference (which always re-renders messages), only to map
+        # sampled token-level logprobs back onto the final canonical render.
+        turn_samples: list[dict[str, Any]] = []
+
         res = InteractionResult(prompt=prompt_text, reward=0, messages=[], info={})
+        res.status = Status.TRUNCATED
 
-        # Multi-turn interaction loop
         for _ in range(max_num_steps):
-            # Prepare payload for sglang
-            text_input = state.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, tools=self.tools_info
-            )
-            # Reformulate tool call instruction for tau-bench
-            text_input = self._reformulate_tool_call(text_input)
-            payload = {"text": text_input, "sampling_params": sampling_params, "return_logprob": True}
+            # Re-render the current message list each turn. After a RESPOND turn
+            # the user simulator's reply advances last_query_index; the chat
+            # template then drops `<think>` from every earlier assistant turn,
+            # so context grows sub-linearly in the number of tool calls.
+            input_text = self._render_messages_text(state, messages, add_generation_prompt=True)
 
-            # Send request to sglang server
-            output = await self._call_llm(url, payload)
-
-            # Collect per-token log probs for agent turn (assistant tokens)
-            agent_token_logprobs = [
-                item[0] for item in output["meta_info"].get("output_token_logprobs", [])
-            ]
-
-            # Check for abort
-            if output["meta_info"]["finish_reason"]["type"] == "abort":
-                res.status = Status.ABORTED
-                return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
-                    rollout_log_probs
-                )
-
-            response = output["text"]
-            # Remove end of conversation token if present
-            if response.endswith("<|im_end|>"):
-                response = response[:-10]
-
-            # Parse tool calls using OpenAI adapter
-            logger.debug(f"Using OpenAI adapter to parse response: {response[:100]}...")
+            payload = {
+                "text": input_text,
+                "sampling_params": sampling_params,
+                "return_logprob": True,
+            }
             try:
-                openai_result = self._parse_tool(response)
-                logger.debug(f"OpenAI adapter result: success={openai_result['success']}")
+                output = await self._call_llm(url, payload)
+            except Exception as e:
+                logger.warning(
+                    f"sglang HTTP call failed for task {task_index}: {e.__class__.__name__}: {e}"
+                )
+                res.status = Status.ABORTED
+                break
 
+            finish_type = output["meta_info"]["finish_reason"]["type"]
+            if finish_type == "abort":
+                res.status = Status.ABORTED
+                break
+
+            # Pull per-token ids + logprobs straight from sglang so every
+            # trained token has the exact logprob that produced it.
+            token_logprobs = output["meta_info"].get("output_token_logprobs") or []
+            cur_token_ids = [item[1] for item in token_logprobs]
+            cur_log_probs = [item[0] for item in token_logprobs]
+            cur_response = output["text"]
+
+            # Some sglang builds emit a trailing <|im_end|>; drop it so we can
+            # append our own turn-terminator consistently below.
+            while cur_token_ids and cur_token_ids[-1] == im_end_id:
+                cur_token_ids.pop()
+                cur_log_probs.pop()
+            if cur_response.endswith("<|im_end|>"):
+                cur_response = cur_response[: -len("<|im_end|>")]
+
+            msg_idx = len(messages)
+            messages.append({"role": "assistant", "content": cur_response})
+            num_turns += 1
+            turn_samples.append({
+                "msg_idx": msg_idx,
+                "sampled_token_ids": list(cur_token_ids),
+                "sampled_log_probs": list(cur_log_probs),
+                "response_text": cur_response,
+                "finish_type": finish_type,
+            })
+
+            # If sglang hit max_new_tokens we intentionally stop here instead
+            # of handing a half-written message to the user simulator — that
+            # feedback loop is what produced the word-salad responses before.
+            # The truncated turn's training signal is later dropped by
+            # _build_training_tensor (its render is unreliable when </think>
+            # never closed).
+            if finish_type == "length":
+                num_length_trunc += 1
+                res.status = Status.TRUNCATED
+                break
+
+            try:
+                openai_result = self._parse_tool(cur_response)
                 if not openai_result["success"]:
-                    logger.warning(f"OpenAI adapter failed: {openai_result['error']}")
                     logger.warning(
-                        f"rollout response: {response} can not be parsed into " f"tool calls {openai_result['error']}"
+                        f"Tool parser failed: {openai_result['error']}; response[:200]={cur_response[:200]!r}"
                     )
                     res.status = Status.ABORTED
-                    return self._build_final_result(
-                        res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
-                        rollout_log_probs
-                    )
-
-                # Extract parsed results
+                    break
                 parsed = openai_result["parsed_result"]
-                logger.debug(
-                    f"Successfully parsed - normal_text: '{parsed['normal_text']}', " f"calls: {parsed['calls']}"
-                )
-
             except Exception as e:
-                logger.warning(f"Exception in OpenAI adapter: {e}")
-                logger.warning(f"rollout response: {response} can not be parsed into " f"tool calls {e}")
+                logger.warning(f"Exception in tool parser: {e}; response[:200]={cur_response[:200]!r}")
                 res.status = Status.ABORTED
-                return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
-                    rollout_log_probs
-                )
+                break
 
-            # Add assistant response to conversation
-            messages.append({"role": "assistant", "content": response})
-            assistant_token_ids, assistant_loss_mask = self._get_token_delta(state.tokenizer, messages)
-            n_agent = len(assistant_token_ids)
-            n_sglang = len(agent_token_logprobs)
-            # sglang may not return logprobs for stop/EOM tokens that _get_token_delta includes
-            # via the chat template. Zero out loss_mask for those positions so their fake 0.0
-            # rollout logprob (= prob 1.0) does not trigger the RS veto.
-            if n_sglang < n_agent:
-                assistant_loss_mask = [1] * n_sglang + [0] * (n_agent - n_sglang)
-            padded_lp = agent_token_logprobs[:n_agent] + [0.0] * max(0, n_agent - n_sglang)
-            response_token_ids.extend(assistant_token_ids)
-            loss_masks.extend(assistant_loss_mask)
-            rollout_log_probs.extend(padded_lp)
-
-            # Execute action in environment
             agent_content, calls = parsed["normal_text"], parsed["calls"]
-            logger.debug(f"Creating action from - content: '{agent_content}', " f"calls: {calls}")
             action = call_to_action_sglang(calls, agent_content)
-            logger.debug(f"Created action: {action}")
 
             try:
                 env_response = await self._execute_tool(env, action)
             except Exception as e:
-                logger.warning("Environment step failed, this is usually related to " "the User simulation call.")
+                logger.warning("Environment step failed (typically a user simulator call error).")
                 logger.warning(f"Error: {e}")
                 res.status = Status.ABORTED
-                return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
-                    rollout_log_probs
-                )
+                break
 
-            logger.debug(f"Environment response: reward={env_response.reward}, " f"done={env_response.done}")
-
-            # Update message history based on action type
-            if action.name != RESPOND_ACTION_NAME:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "name": action.name,
-                        "content": env_response.observation,
-                    }
-                )
-            else:
-                # Direct response from user
-                messages.append({"role": "user", "content": env_response.observation})
-
-            # Update token tracking
-            env_token_ids, env_loss_mask = self._get_token_delta(state.tokenizer, messages)
-            response_token_ids.extend(env_token_ids)
-            loss_masks.extend(env_loss_mask)
-            # Pad rollout_log_probs with 0.0 for env/tool tokens (not trained on)
-            rollout_log_probs.extend([0.0] * len(env_token_ids))
-
-            # Update reward and info
             total_reward = env_response.reward
             info = {**info, **env_response.info.model_dump()}
 
-            # Check if done
+            if action.name != RESPOND_ACTION_NAME:
+                num_tool_calls += 1
+                messages.append({
+                    "role": "tool",
+                    "name": action.name,
+                    "content": env_response.observation,
+                })
+            else:
+                num_respond_turns += 1
+                messages.append({"role": "user", "content": env_response.observation})
+
             if env_response.done:
                 res.status = Status.COMPLETED
                 break
 
-        # Handle truncation
-        if not env_response.done:
-            res.status = Status.TRUNCATED
-
-        return self._build_final_result(
-            res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
-            rollout_log_probs
+        # Reconstruct (response_token_ids, loss_masks, rollout_log_probs)
+        # from the canonical final render. See _build_training_tensor for the
+        # think-preserved / think-stripped alignment cases.
+        response_token_ids, loss_masks, rollout_log_probs, response_text = self._build_training_tensor(
+            state, messages, prompt_token_ids, turn_samples, im_end_id, asst_prompt_token_ids,
         )
 
-    def _get_token_delta(self, tokenizer: AutoTokenizer, messages: list[dict]) -> tuple[list[int], list[int]]:
-        """
-        Calculate token delta for multi-turn conversations.
+        # Per-turn format check: every assistant turn must look like
+        #   <think>...</think><tool_call>...</tool_call>   or
+        #   <think>...</think>{plain text}
+        # If any turn fails, subtract an additive penalty from the task reward.
+        # We charge winners more than losers (see FORMAT_BAD_PENALTY_* above):
+        # the old multiplicative form left 0-reward failures unpunished, so we
+        # still bill them, but lightly so format noise doesn't drown the task
+        # signal in the (much larger) failure bucket.
+        format_ok, n_assist_turns, n_bad_turns = _trajectory_format_ok(messages)
+        raw_task_reward = total_reward
+        if not format_ok:
+            penalty = FORMAT_BAD_PENALTY_SUCCESS if raw_task_reward > 0 else FORMAT_BAD_PENALTY_FAIL
+            total_reward = total_reward - penalty
 
-        Tokenization logic adapted from:
-        https://verl.readthedocs.io/en/v0.4.1/sglang_multiturn/multiturn.html
-        to calculate the right token count in a multi-turn environment using
-        delta between messages.
+        # Direct CoT-length penalty: discourage verbose <think> blocks even
+        # when the trajectory completes inside the length cap. Without this,
+        # the model can keep growing CoT as long as it eventually finishes,
+        # and the indirect "truncation = -0.2" signal only fires at the cliff.
+        total_think_chars = 0
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            for blk in _THINK_BLOCK_RE.findall(msg.get("content", "")):
+                total_think_chars += len(blk)
+        avg_think_chars = total_think_chars / max(n_assist_turns, 1)
+        think_overage = max(0.0, avg_think_chars - THINK_BUDGET_PER_TURN_CHARS)
+        think_length_penalty = min(THINK_PENALTY_CAP, think_overage * THINK_PENALTY_PER_OVERAGE_CHAR)
+        total_reward = total_reward - think_length_penalty
 
-        Args:
-            tokenizer: Tokenizer instance
-            messages: Conversation messages
+        # Populate the metadata keys slime auto-logs to wandb (see
+        # slime/ray/rollout.py::compute_metrics_from_samples).
+        info["num_turns"] = num_turns
+        info["num_tool_calls"] = num_tool_calls
+        info["num_respond_turns"] = num_respond_turns
+        info["num_length_trunc"] = num_length_trunc
+        info["has_tool_call"] = int(num_tool_calls > 0)
+        info["tool_call_turn_frac"] = (num_tool_calls / num_turns) if num_turns > 0 else 0.0
+        info["answer_correct"] = int(raw_task_reward > 0)
+        info["env_done"] = int(res.status == Status.COMPLETED)
+        info["is_aborted"] = int(res.status == Status.ABORTED)
+        info["format_ok"] = int(format_ok)
+        info["format_bad_turns"] = n_bad_turns
+        info["raw_task_reward"] = float(raw_task_reward)
+        info["avg_think_chars"] = float(avg_think_chars)
+        info["think_length_penalty"] = float(think_length_penalty)
+        info["trained_token_count"] = int(sum(loss_masks))
 
-        Returns:
-            Tuple of (token_ids, loss_mask)
-        """
-        curr = tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
-        token_ids = []
-        loss_mask = []
-
-        # Case 1: last message is an assistant response
-        if messages[-1]["role"] == "assistant":
-            prev = tokenizer.apply_chat_template(messages[:-1], add_generation_prompt=True, tokenize=False)
-            new_tokens = tokenizer.encode(curr[len(prev) :], add_special_tokens=False)
-            token_ids += new_tokens
-            loss_mask += [1] * len(new_tokens)  # Mask only the new assistant tokens
-        else:
-            # Case 2: last message is a tool response or environment observation
-            prev = tokenizer.apply_chat_template(messages[:-1], add_generation_prompt=False, tokenize=False)
-            new_tokens = tokenizer.encode(curr[len(prev) :], add_special_tokens=False)
-            token_ids += new_tokens
-            loss_mask += [0] * len(new_tokens)  # Don't mask environment/tool tokens
-
-        return token_ids, loss_mask
+        # Saved `response` keeps every turn's <think> for inspection; training
+        # tensors (tokens/loss_mask/rollout_log_probs) remain aligned with the
+        # canonical stripped render so the per-token prefix at backprop time
+        # still matches what each turn saw at sampling time.
+        verbose_response_text = self._build_verbose_response_text(messages)
+        return self._build_final_result(
+            res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids,
+            rollout_log_probs, response_text=verbose_response_text,
+        )
 
     def _build_final_result(
         self,
@@ -399,6 +703,7 @@ class TrainableAgentMixin:
         prompt_token_ids: list[int],
         response_token_ids: list[int],
         rollout_log_probs: list[float] | None = None,
+        response_text: str | None = None,
     ) -> InteractionResult:
         """
         Build the final interaction result with all collected data.
@@ -421,7 +726,13 @@ class TrainableAgentMixin:
         res.messages = messages
         res.loss_mask = loss_masks
         res.tokens = prompt_token_ids + response_token_ids
-        res.response = "".join([msg.get("content", "") for msg in messages if msg["role"] == "assistant"])
+        # response is the verbose (think-preserving) multi-turn rendered string
+        # for inspection — built by _build_verbose_response_text. Note: it does
+        # NOT match tokens token-for-token, because tokens come from the
+        # canonical apply_chat_template render which strips historical <think>.
+        # Training-relevant fields (tokens/loss_mask/rollout_log_probs) are the
+        # source of truth; `response` is for vis_rollout_data / debugging only.
+        res.response = response_text if response_text is not None else ""
         res.response_length = len(loss_masks)
         res.rollout_log_probs = rollout_log_probs
 

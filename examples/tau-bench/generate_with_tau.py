@@ -82,6 +82,14 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
         rollout_log_probs=res.rollout_log_probs,
     )
 
+    # Truncated trajectories: keep them in the batch with a clearly negative
+    # reward instead of dropping. Magnitude (-0.2) is set so truncation is
+    # *worse* than a format-bad failure (-0.1); otherwise the model finds it
+    # cheaper to keep thinking until the length cap fires than to emit an
+    # imperfect tool_call, which directly drives CoT longer.
+    if status == Sample.Status.TRUNCATED:
+        sample.reward = -0.2
+
     # Ensure response_length is set correctly
     if hasattr(res, "response_length"):
         sample.response_length = res.response_length

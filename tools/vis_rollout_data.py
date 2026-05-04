@@ -1,19 +1,19 @@
 import torch
 import numpy as np
 
-path = "/data1/whx/multi_stage_rl_log/search_Qwen3-30B-A3B_tis_bs_64_memory_qwen_gspo_sft_light_80/rollout_135.pt"
+path = "/data2/whx/multi_stage_rl_log/tau-bench_Qwen3-30B-A3B_tis_bs_8_mask_penalty_filter_chat_template/rollout_1.pt"
 d = torch.load(path, weights_only=False)
 
 print("rollout_id:", d["rollout_id"])
 print("samples 数量:", len(d["samples"]))
 
 # 看前 2 个 sample 的主要字段
-st = 96
+st = 12
 for i, s in enumerate(d["samples"][st:st+1]):
     print("\n--- sample", i, "---")
     print("prompt :", (s.get("prompt") or "")[:])
     print("response :", (s.get("response") or "")[:])
-    # print("reward:", s.get("reward"))
+    print("reward:", s.get("reward"))
     # print("response_length:", s.get("response_length"))
 
 

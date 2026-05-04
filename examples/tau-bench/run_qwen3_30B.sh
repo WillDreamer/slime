@@ -33,7 +33,7 @@ MODEL_ROOT=/data2/whx
 WANDB_API_KEY="${WANDB_API_KEY}"
 ROLLOUT_BATCH_SIZE=8
 GLOBAL_BATCH_SIZE=64
-WANDB_GROUP="tau-bench_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}"
+WANDB_GROUP="tau-bench_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_mask_penalty_filter_chat_template"
 ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/multi_stage_rl_log/${WANDB_GROUP}"
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  # <<<------  which GPUs to use, directly fill here
@@ -50,38 +50,38 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
-   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_strict_v3_gspo_cold_then_mask/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_tau/
-   --save-interval 20
-   --save-retain-interval 40
+   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_math_search_sft_filter/
+   --load ${ROOT_DIR}/Qwen3-30B-A3B_math_search_sft_filter/
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_search_sft_tau/
+   --save-interval 30
+   --save-retain-interval 60
    --finetune
    --start-rollout-id 0
-   --skip-eval-before-train True
+   --skip-eval-before-train False
 )
 
 ROLLOUT_ARGS=(
    --prompt-data ${ROOT_DIR}/tau-bench/retail_train_tasks.jsonl
    --input-key index
    --rollout-shuffle
-   --num-rollout 500
+   --num-rollout 300
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt 8
    --rollout-max-response-len 1024
-   --rollout-max-context-len 131072
+   # --rollout-max-context-len 131072
    --rollout-temperature 1
    --global-batch-size ${GLOBAL_BATCH_SIZE}
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_raw_task_reward_nonzero_std
    --balance-data
    --save-debug-rollout-data "${ROLLOUT_DEBUG_DIR}/rollout_{rollout_id}.pt"
 )
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data retail-dev ${ROOT_DIR}/tau-bench/retail_dev_tasks.jsonl
+   --eval-prompt-data retail-dev ${ROOT_DIR}/tau-bench/retail_test_tasks.jsonl
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 1024
-   --eval-top-k 1
+   --eval-temperature 0.7
 )
 
 PERF_ARGS=(
@@ -101,9 +101,9 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator gspo
    --use-kl-loss
-   --kl-loss-coef 0.001
+   --kl-loss-coef 0.1
    --kl-loss-type low_var_kl
-   --entropy-coef 0.00
+   --entropy-coef 0.01
    --eps-clip 0.2
    --eps-clip-high 0.28
    # whether enabling TIS
@@ -134,9 +134,9 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8
    --sglang-mem-fraction-static 0.8
    --sglang-ep-size 4
-   --sglang-max-total-tokens 1500000
-   --sglang-context-length 131072
-   --sglang-json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'
+   # --sglang-max-total-tokens 1500000
+   # --sglang-context-length 131072
+   # --sglang-json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'
    # If gemini API reports concurrency limit error, set this parameter to reduce the concurrency
    # --sglang-server-concurrency 32
 )

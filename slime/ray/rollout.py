@@ -1195,6 +1195,34 @@ def compute_metrics_from_samples(args, samples):
     if void_masked_vals:
         log_dict["void_mask_rate"] = np.mean(void_masked_vals).item()
 
+    # Multi-turn agent metrics (tau-bench and similar envs): distributions
+    # over per-trajectory counts plus rates for env-done / abort.
+    num_tool_calls_list = [
+        s.metadata.get("num_tool_calls") for s in samples if s.metadata.get("num_tool_calls") is not None
+    ]
+    if num_tool_calls_list:
+        log_dict |= dict_add_prefix(compute_statistics(num_tool_calls_list), "num_tool_calls/")
+
+    num_respond_list = [
+        s.metadata.get("num_respond_turns") for s in samples if s.metadata.get("num_respond_turns") is not None
+    ]
+    if num_respond_list:
+        log_dict |= dict_add_prefix(compute_statistics(num_respond_list), "num_respond_turns/")
+
+    num_length_trunc_list = [
+        s.metadata.get("num_length_trunc") for s in samples if s.metadata.get("num_length_trunc") is not None
+    ]
+    if num_length_trunc_list:
+        log_dict["length_trunc_rate"] = np.mean([int(x > 0) for x in num_length_trunc_list]).item()
+
+    env_done_vals = [s.metadata.get("env_done") for s in samples if s.metadata.get("env_done") is not None]
+    if env_done_vals:
+        log_dict["env_done_rate"] = np.mean(env_done_vals).item()
+
+    aborted_vals = [s.metadata.get("is_aborted") for s in samples if s.metadata.get("is_aborted") is not None]
+    if aborted_vals:
+        log_dict["aborted_rate"] = np.mean(aborted_vals).item()
+
     return log_dict
 
 

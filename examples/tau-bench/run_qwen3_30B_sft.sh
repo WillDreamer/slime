@@ -49,9 +49,9 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
    --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_80_gspo_4k/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_math_search_sft_tau/
-   --save-interval 20
-   --save-retain-interval 40
+   --save ${ROOT_DIR}/Qwen3-30B-A3B_math_search_sft_filter/
+   --save-interval 10
+   --save-retain-interval 10
    --finetune
    --start-rollout-id 0
 )
@@ -59,11 +59,11 @@ CKPT_ARGS=(
 SFT_ARGS=(
    # Custom rollout function: reads pre-tokenized trajectories, no generation
    --rollout-function-path sft_rollout_from_rollout.generate_rollout
-   --prompt-data ${SFT_DATA_DIR}/sft_data.jsonl
+   --prompt-data ${SFT_DATA_DIR}/sft_data_filter.jsonl
    --input-key data
    --rollout-global-dataset
    --rollout-shuffle
-   --num-epoch 1
+   --num-epoch 5
    --rollout-batch-size 64
    --global-batch-size 64
 
