@@ -24,17 +24,17 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 ROOT_DIR=/data1/whx
-MODEL_ROOT=/data2/whx
+MODEL_ROOT=/xuanwu-tank/center/whx
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
-source "${SCRIPT_DIR}/../../scripts/models/qwen3-30B-A3B.sh"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-8B.sh"
 WANDB_API_KEY="${WANDB_API_KEY}"
 ROLLOUT_BATCH_SIZE=64
-GLOBAL_BATCH_SIZE=320
+GLOBAL_BATCH_SIZE=512
 
-## v3 加大kl 0.1,答对但没有toolcall降到0.2
-WANDB_GROUP="search_Qwen3-30B-A3B_tis_bs_${ROLLOUT_BATCH_SIZE}_memory_qwen_gspo_sft_light_80_mask_4k"
-ROLLOUT_DEBUG_DIR="${ROOT_DIR}/multi_stage_rl_log/${WANDB_GROUP}"
+
+WANDB_GROUP="search_bs_${ROLLOUT_BATCH_SIZE}"
+ROLLOUT_DEBUG_DIR="${MODEL_ROOT}/MultiStageRL/${WANDB_GROUP}"
 
 
 GPU_LIST=(0 1 2 3 4 5 6 7)  
@@ -45,19 +45,16 @@ NUM_GPUS=${#GPU_LIST[@]}
 echo "Detected ${NUM_GPUS} GPUs for this run"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_ROOT}/Qwen/Qwen3-30B-A3B-Base/
-   --ref-load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_search_light/
-   --load ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_search_light/
-   --save ${ROOT_DIR}/Qwen3-30B-A3B_base_math_sft_80_gspo_4k/
+   --hf-checkpoint ${MODEL_ROOT}/Qwen3-8B-Base/
+   --ref-load ${MODEL_ROOT}/MultiStageRL/Qwen3-8B-Base-Math-SeaSFT
+   --load ${MODEL_ROOT}/MultiStageRL/Qwen3-8B-Base-Math-SeaSFT
+   --save ${MODEL_ROOT}/MultiStageRL/Qwen3-8B-Base-Math-SeaSFT-Search
    --save-interval 20
    --save-retain-interval 60
    --finetune
    --start-rollout-id 0
 )
 
-# --finetune 的效果（参见 Megatron 的 checkpointing.py 第 1711 行）：
-# 只加载模型权重，跳过 optimizer 和 lr scheduler 的状态恢复
-# iteration 从 0 重新开始，不会接着 math 的 iteration 继续计数
 
 ROLLOUT_ARGS=(
    --prompt-data ${ROOT_DIR}/Search-R1/data/nq_hotpotqa_train/train.parquet
@@ -68,7 +65,7 @@ ROLLOUT_ARGS=(
    --num-rollout 500
    # --override-opt-param-scheduler
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
-   --n-samples-per-prompt 5
+   --n-samples-per-prompt 8
    --rollout-max-response-len 4096
    --rollout-temperature 1
 
@@ -90,9 +87,7 @@ PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
-   --expert-model-parallel-size 4
-   --expert-tensor-parallel-size 1
+   --context-parallel-size 2
 
    --recompute-granularity full
    --recompute-method uniform
@@ -106,9 +101,9 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator gspo
    --use-kl-loss
-   --kl-loss-coef 0.15
+   --kl-loss-coef 0.01
    --kl-loss-type low_var_kl
-   --entropy-coef 0.01
+   --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
 
@@ -123,14 +118,14 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.01
    --adam-beta1 0.9
    --adam-beta2 0.98
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
+   # --optimizer-cpu-offload
+   # --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
 )
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project Seq-train
+   --wandb-project Seq-train-8B
    --wandb-group ${WANDB_GROUP}
    --wandb-key ${WANDB_API_KEY}
    --disable-wandb-random-suffix
@@ -139,8 +134,8 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    # MoE related args
    --rollout-num-gpus-per-engine ${NUM_GPUS}
-   --sglang-mem-fraction-static 0.6
-   --sglang-ep-size 4
+   --sglang-mem-fraction-static 0.7
+   # --sglang-ep-size 4
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    # --sglang-enable-dp-attention
    # --sglang-dp-size 8
@@ -167,21 +162,40 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_search_tools_qwen_sft.generate
-   --custom-rm-path generate_with_search_tools_qwen_sft.reward_func
-#    --custom-generate-function-path generate_with_search_tools_qwen_sft_no_drift.generate
-# --custom-rm-path generate_with_search_tools_qwen_sft_no_drift.reward_func
-# --custom-tis-function-path generate_with_search_tools_qwen_sft_no_drift.compute_mis_weights_with_cp_no_drift
+   --custom-generate-function-path generate_with_search_tools_qwen_sft_no_drift.generate
+   --custom-rm-path generate_with_search_tools_qwen_sft_no_drift.reward_func
 
    # Group-gated loss-mask: when >50% of a group has no real tool execution,
    # zero out the loss_mask of the no-tool samples (they still count toward
    # group-relative advantage). See no_tool_loss_mask_filter.py.
    --dynamic-sampling-filter-path no_tool_loss_mask_filter.no_tool_loss_mask_filter
 
-   # TIS-related args, recommended to enable when using TIS
-   --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
-   --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
+   # TIS-related args, recommended to enable when using TIS.
+   # 8B-specific copy so its thresholds can be tuned without touching the 30B run.
+   --custom-config-path examples/train_infer_mismatch_helper/mis_8b.yaml
+   # NOTE: this run uses the *_no_drift* generate fn with --apply-chat-template,
+   # which writes placeholder rollout_log_prob=0.0 on all chat-template glue
+   # (<|im_end|>\n, <|im_start|>user\n<tool_response>..., <|im_start|>assistant\n)
+   # and tool_response tokens. Use the matching _no_drift TIS wrapper (NOT the
+   # generic mis.compute_mis_weights_with_cp): it masks every rollout_log_prob==0.0
+   # position before computing IS weights, so exp(train_lp - 0.0) garbage never
+   # enters the gradient. Must pair with generate_with_search_tools_qwen_sft_no_drift.generate above.
+   --custom-tis-function-path generate_with_search_tools_qwen_sft_no_drift.compute_mis_weights_with_cp_no_drift
 )
+
+# Strip historical-turn <think> blocks during rollout + training (Qwen3
+# multi-turn convention; compresses prefill context). Must be exported
+# BEFORE `ray start` so the rollout actors inherit it.
+# Read by generate_with_search_tools_qwen_sft_no_drift._should_strip_think.
+#
+# OFF: with strip_think the rollout prefill strips past-turn think, so the
+# direct-concat build_training_data must slice past-turn bodies to the
+# post-</think> tail (a token-count slice that can drift by ~1 BPE token).
+# With it OFF every turn's full streamed body is concatenated verbatim, so
+# the trained sequence is byte-exact to what sglang prefilled (zero IS bias)
+# and matches the SFT distribution. Turn back ON only once the policy
+# reliably emits canonical <think> and prefill length becomes a problem.
+export SEARCH_R1_STRIP_THINK=0
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -199,16 +213,6 @@ mkdir -p "$RAY_TMPDIR"
 
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --temp-dir ${MODEL_ROOT}/ray_temp 
 
-# RUNTIME_ENV_JSON="{
-#   \"env_vars\": {
-#     \"PYTHONPATH\": \"${ROOT_DIR}/Megatron-LM/:${SCRIPT_DIR}\",
-#     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
-#   }
-# }"
-
-# ray job submit --address="http://127.0.0.1:8265" \
-#    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-#    -- python3 train.py \
 
 export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
 

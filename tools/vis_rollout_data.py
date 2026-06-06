@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-path = "/data2/whx/multi_stage_rl_log/tau-bench_Qwen3-30B-A3B_tis_bs_8_mask_penalty_filter_chat_template/rollout_1.pt"
+path = "/xuanwu-tank/center/whx/MultiStageRL/tau-bench_Qwen3-8B_bs_64/rollout_15.pt"
 d = torch.load(path, weights_only=False)
 
 print("rollout_id:", d["rollout_id"])

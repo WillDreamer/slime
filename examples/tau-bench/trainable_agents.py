@@ -17,21 +17,31 @@ logger = logging.getLogger(__name__)
 
 
 # Format-check regexes for the per-turn shape we want every assistant turn to take:
-#   (A) tool-call turn:  <think>...</think><tool_call>...</tool_call>
-#   (B) respond turn:    <think>...</think>{plain natural-language reply}
-# Anything else (no <think>, mismatched tags, garbage / repetition / template
-# soup tail after the answer text, double <think> blocks, etc.) is "format-bad"
-# and the trajectory pays an additive FORMAT_BAD_PENALTY on its task reward.
+#   (A) tool-call turn:  [<think>...</think>]<tool_call>...</tool_call>
+#   (B) respond turn:    [<think>...</think>]{plain natural-language reply}
+# The `<think>...</think>` prefix is OPTIONAL: this model (TauSFT init) is a
+# no-think tool-calling agent, and Qwen3's chat template strips `<think>` from
+# every historical assistant turn before the last user query anyway, so the
+# canonical per-turn shape carries no visible CoT. Requiring `<think>` made
+# format_ok==0 on 100% of turns, turning FORMAT_BAD_PENALTY into a flat tax on
+# winners (zero signal). We now only reject genuine structural garbage:
+# mismatched/double tags, leftover <tool_call>/<tool_response>/<|im_*|> markup
+# in the natural-language tail, etc. If a turn *does* emit <think>, it must be a
+# single non-nested block before the action — a malformed/double <think> is
+# still format-bad. Bad turns pay an additive FORMAT_BAD_PENALTY on task reward.
 _FORMAT_TOOLCALL_RE = re.compile(
-    r"\A\s*<think>(?!.*<think>).*?</think>\s*<tool_call>(?!.*<tool_call>).*?</tool_call>\s*\Z",
+    r"\A\s*(?:<think>(?!.*<think>).*?</think>\s*)?<tool_call>(?!.*<tool_call>).*?</tool_call>\s*\Z",
     re.DOTALL,
 )
 _FORMAT_THINK_PREFIX_RE = re.compile(
-    r"\A\s*<think>(?!.*<think>).*?</think>(?P<after>.*)\Z",
+    r"\A\s*(?:<think>(?!.*<think>).*?</think>)?(?P<after>.*)\Z",
     re.DOTALL,
 )
 # Additive penalties subtracted from total_reward when any assistant turn is
-# format-bad. Weakened so format noise can't dominate the task signal:
+# format-bad. With the <think> requirement dropped (see regex block), format_ok
+# now passes on ~96% of trajectories, so this fires only on genuine structural
+# garbage (~4%) instead of every turn — it is a real signal again, not a flat
+# tax on winners. Weakened so format noise can't dominate the task signal:
 #   - Successful (raw>0): pay 0.1 — light tap, still leaves +0.9 reward.
 #   - Failed (raw==0): no penalty. We rely on the task gradient (and SFT) for
 #     format learning; double-charging failures was hurting more than helping.
@@ -51,9 +61,10 @@ _THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 def _assistant_turn_format_ok(content: str) -> bool:
     """A single assistant turn is well-formed iff its raw text matches one of:
-        <think>...</think><tool_call>...</tool_call>               (tool turn)
-        <think>...</think>{plain text without XML markup garbage}  (respond turn)
-    Reject double-<think>, double-<tool_call>, leftover <|im_start|>/<|im_end|>/
+        [<think>...</think>]<tool_call>...</tool_call>               (tool turn)
+        [<think>...</think>]{plain text without XML markup garbage}  (respond turn)
+    The `<think>...</think>` prefix is OPTIONAL (see regex block above). Reject
+    double-<think>, double-<tool_call>, leftover <|im_start|>/<|im_end|>/
     <tool_response> markup in the natural-language tail, etc.
     """
     if not content:
@@ -637,8 +648,10 @@ class TrainableAgentMixin:
         )
 
         # Per-turn format check: every assistant turn must look like
-        #   <think>...</think><tool_call>...</tool_call>   or
-        #   <think>...</think>{plain text}
+        #   [<think>...</think>]<tool_call>...</tool_call>   or
+        #   [<think>...</think>]{plain text}
+        # (the <think> prefix is optional — this is a no-think agent and the
+        # chat template strips historical <think> anyway; see regex block).
         # If any turn fails, subtract an additive penalty from the task reward.
         # We charge winners more than losers (see FORMAT_BAD_PENALTY_* above):
         # the old multiplicative form left 0-reward failures unpunished, so we
