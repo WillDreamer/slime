@@ -51,3 +51,45 @@ bash examples/tau-bench/run_qwen3_8B_rollout_only.sh
 
 bash examples/tau-bench/run_qwen3_8B_sft.sh 
 ```
+
+
+### Qwen3.5-9B version
+1. Run the docker
+```bash
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /xuanwu-tank/center/whx:/xuanwu-tank/center/whx \
+  -it slimerl/slime:latest /bin/bash
+```
+Install the env
+```bash
+# 路径可根据实际情况调整
+cd /root/slime
+git pull
+pip uninstall -y nvidia-cudnn-cu12 nvidia-cudnn-cu11 nvidia-cudnn 2>/dev/null || true
+pip install -e . --no-deps
+```
+
+Quit and save the docker
+```bash
+# Find docker container ID
+docker ps
+docker commit xxx whx/MSRL:latest
+```
+<!-- export  CUDA_VISIBLE_DEVICES=6,7
+sglang serve \
+  --model-path /xuanwu-tank/center/whx/Qwen3.5/Qwen3.5-9B-Base \
+  --dtype bfloat16 \
+  --tp 1 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code -->
+
+2. VLM Reasoning
+
+2.1 Download the data
+```bash
+hf download --repo-type dataset VeraIsHere/geo3k_imgurl_processed --local-dir /xuanwu-tank/center/whx/geo3k_imgurl_processed
+```
+
+2.2

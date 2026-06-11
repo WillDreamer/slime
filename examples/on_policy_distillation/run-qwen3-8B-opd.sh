@@ -4,15 +4,27 @@
 
 set -ex
 
+Model_root="/xuanwu-tank/center/whx"
+Data_root="/data1/whx/"
+
+# ---- GPU allocation (this machine: GPUs 0-3 busy, 4-7 free) ----
+# Teacher (Qwen3-8B) takes one dedicated GPU OUTSIDE Ray.
+# The rest go to Ray for colocated actor + rollout (student).
+TEACHER_GPU=4              # <<<------ GPU for the teacher server
+GPU_LIST=(5 6 7)          # <<<------ GPUs for training (Ray, colocate)
+NUM_GPUS=${#GPU_LIST[@]}
+TRAIN_CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
+echo "Teacher GPU: ${TEACHER_GPU}; training GPUs: ${TRAIN_CUDA_VISIBLE_DEVICES} (${NUM_GPUS} GPUs)"
 
 # Start the teacher model server
 TEACHER_IP="127.0.0.1" # Use localhost here, you can change it to your IP
 TEACHER_PORT=13141
-LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
+rm -f ${Model_root}/tmp/*
+LOG_FILE="${Model_root}/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
 ## Launch the teacher model server in the background
-CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server \
-    --model-path /root/Qwen3-32B \
+CUDA_VISIBLE_DEVICES=${TEACHER_GPU} python3 -m sglang.launch_server \
+    --model-path ${Model_root}/Qwen3/Qwen3-8B \
     --host 0.0.0.0 \
     --port $TEACHER_PORT \
     --tp 1 \
@@ -44,19 +56,19 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime/scripts/models/qwen3-8B.sh"
+source "${Data_root}/slime/scripts/models/qwen3-8B.sh"
 
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-8B
-   --ref-load /root/Qwen3-8B_torch_dist
-   --load /root/Qwen3-8B_slime/
-   --save /root/Qwen3-8B_slime/
+   --hf-checkpoint ${Model_root}/Qwen3/Qwen3-8B
+   --ref-load ${Model_root}/Qwen3/Qwen3-8B_torch_dist
+   --load ${Model_root}/Qwen3/Qwen3-0.6B/
+   --save ${Model_root}/Qwen3/Qwen3-0.6B_OPD/
    --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data ${Model_root}/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --apply-chat-template
    --rollout-shuffle
@@ -85,8 +97,9 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
-   --sequence-parallel
+   # TP=1: the 0.6B student needs no tensor parallelism, and colocate on 3
+   # GPUs requires NUM_GPUS divisible by TP. (--sequence-parallel needs TP>1, removed.)
+   --tensor-model-parallel-size 1
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -145,22 +158,23 @@ MISC_ARGS=(
 
 
 
-# launch the master node of ray in container
+# ---- launch training (tau-bench style: ray start + direct python3 train.py) ----
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export PYTHONPATH="${Data_root}/slime:${Data_root}/Megatron-LM:${PYTHONPATH}"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export RAY_TMPDIR="/data1/ray_out"
+rm -rf "$RAY_TMPDIR"
+mkdir -p "$RAY_TMPDIR"
 
+# Restrict Ray to the training GPUs only (the teacher already holds ${TEACHER_GPU}).
+export CUDA_VISIBLE_DEVICES=${TRAIN_CUDA_VISIBLE_DEVICES}
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{
-     "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM/",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
-     }
-   }' \
-   -- python3 train.py \
+python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 4 \
+   --actor-num-gpus-per-node ${NUM_GPUS} \
+   --num-gpus-per-node ${NUM_GPUS} \
+   --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
