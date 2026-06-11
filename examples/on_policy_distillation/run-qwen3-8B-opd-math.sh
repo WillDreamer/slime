@@ -7,43 +7,25 @@ set -ex
 Model_root="/xuanwu-tank/center/whx"
 Data_root="/data1/whx/"
 
-# ---- GPU allocation (this machine: GPUs 0-3 busy, 4-7 free) ----
-# Teacher (Qwen3-8B) takes one dedicated GPU OUTSIDE Ray.
-# The rest go to Ray for colocated actor + rollout (student).
-TEACHER_GPU=4              # <<<------ GPU for the teacher server
-GPU_LIST=(5 6 7)          # <<<------ GPUs for training (Ray, colocate)
+# ---- GPU allocation: teacher is served remotely, so ALL GPUs go to training ----
+GPU_LIST=(0 1 2 3 4 5 6 7)        # <<<------ all GPUs for training (Ray, colocate)
 NUM_GPUS=${#GPU_LIST[@]}
 TRAIN_CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
-echo "Teacher GPU: ${TEACHER_GPU}; training GPUs: ${TRAIN_CUDA_VISIBLE_DEVICES} (${NUM_GPUS} GPUs)"
+echo "Training GPUs: ${TRAIN_CUDA_VISIBLE_DEVICES} (${NUM_GPUS} GPUs); teacher served remotely"
 
-# Start the teacher model server
-TEACHER_IP="127.0.0.1" # Use localhost here, you can change it to your IP
-TEACHER_PORT=13141
-rm -f ${Model_root}/tmp/*
-LOG_FILE="${Model_root}/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
+# ---- Remote teacher model server (already deployed elsewhere) ----
+# NOTE: the OPD reward func (slime.rollout.on_policy_distillation.reward_func)
+# posts raw student token ids to sglang's NATIVE /generate endpoint (not the
+# OpenAI-compatible /v1 path) and reads meta_info.input_token_logprobs.
+TEACHER_URL="http://131.179.168.120:8098"
 
-## Launch the teacher model server in the background
-CUDA_VISIBLE_DEVICES=${TEACHER_GPU} python3 -m sglang.launch_server \
-    --model-path ${Model_root}/Qwen3/Qwen3-8B \
-    --host 0.0.0.0 \
-    --port $TEACHER_PORT \
-    --tp 1 \
-    --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.6 \
-    > "$LOG_FILE" 2>&1 &
-
-echo "Starting teacher model server..."
-
-## Wait for the teacher model server to be ready
-until curl -sf http://$TEACHER_IP:$TEACHER_PORT/health_generate > /dev/null; do
-    echo "Waiting for the teacher model server to start..."
-    tail -n 10 "$LOG_FILE"
+## Wait until the remote teacher is reachable, then show what it is serving.
+until curl -sf ${TEACHER_URL}/health_generate > /dev/null; do
+    echo "Waiting for the remote teacher model server at ${TEACHER_URL}..."
     sleep 5
 done
-
-curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
-echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
-sleep 10
+curl -s ${TEACHER_URL}/get_model_info; echo
+echo "Remote teacher model server is up at ${TEACHER_URL}."
 
 
 export PYTHONBUFFERED=16
@@ -62,8 +44,8 @@ source "${Data_root}/slime/scripts/models/qwen3-8B.sh"
 CKPT_ARGS=(
    --hf-checkpoint ${Model_root}/Qwen3/Qwen3-8B
    --ref-load ${Model_root}/Qwen3/Qwen3-8B_torch_dist
-   --load ${Model_root}/Qwen3/Qwen3-0.6B/
-   --save ${Model_root}/Qwen3/Qwen3-0.6B_OPD/
+   --load ${Model_root}/MultiStageRL/Qwen3-8B-Base-Math
+   --save ${Model_root}/MultiStageRL/Qwen3-8B-Base-Math-SeaSFT-Search-TauSFT-Tau-OPD
    --save-interval 20
 )
 
@@ -73,19 +55,19 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --num-rollout 300
-   --rollout-batch-size 16
-   --n-samples-per-prompt 4
+   --rollout-batch-size 256
+   --n-samples-per-prompt 8
    --rollout-max-response-len 16384
    --rollout-temperature 1
 
-   --global-batch-size 64
+   --global-batch-size 2048
    --balance-data
 )
 
 RM_ARGS=(
    --custom-rm-path slime.rollout.on_policy_distillation.reward_func
    --custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
-   --rm-url http://$TEACHER_IP:$TEACHER_PORT/generate
+   --rm-url ${TEACHER_URL}/generate
 )
 
 EVAL_ARGS=(
@@ -135,15 +117,16 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-8B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project OPD-8B
+   --wandb-group ${WANDB_GROUP}
+   --wandb-key ${WANDB_API_KEY}
+   --disable-wandb-random-suffix
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.4
+   --sglang-mem-fraction-static 0.8
 )
 
 

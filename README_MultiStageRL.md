@@ -51,7 +51,10 @@ bash examples/tau-bench/run_qwen3_8B_rollout_only.sh
 
 bash examples/tau-bench/run_qwen3_8B_sft.sh 
 ```
-
+3.3 RL
+```bash
+bash examples/tau-bench/run_qwen3_8B.sh
+```
 
 ### Qwen3.5-9B version
 1. Run the docker
@@ -93,3 +96,16 @@ hf download --repo-type dataset VeraIsHere/geo3k_imgurl_processed --local-dir /x
 ```
 
 2.2
+
+
+## OPD
+
+1. Deploy the teacher on scai7
+```bash
+# --model-path /xuanwu-tank/center/whx/MultiStageRL/Qwen3-8B-Base-Math/hf_iter_0000300 \
+CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
+  --model-path /xuanwu-tank/center/whx/MultiStageRL/Qwen3-8B-Base-Math-SeaSFT-Search/hf_iter_0000420 \
+  --host 0.0.0.0 --port 30012 \
+  --tp 1 --mem-fraction-static 0.9 \
+  --reasoning-parser qwen3 --tool-call-parser qwen
+```
