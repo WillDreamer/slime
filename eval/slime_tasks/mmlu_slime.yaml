@@ -1,0 +1,28 @@
+task: mmlu_slime
+# MMLU zero-shot CoT — chat completion, mimicking slime simple-evals format.
+# Prompt: "Think step by step... Answer: $LETTER"  (simple-evals QUERY_TEMPLATE_MULTICHOICE)
+# Parsing: extract "Answer: X" from post-</think> text  (matches ANSWER_PATTERN_MULTICHOICE)
+# Model: local-chat-completions, no system prompt (matches slime training: apply_chat_template, no system)
+dataset_path: cais/mmlu
+dataset_name: all
+test_split: test
+fewshot_split: validation
+output_type: generate_until
+num_fewshot: 0
+doc_to_text: !function utils.doc_to_text_mmlu
+doc_to_target: "{{answer}}"
+process_results: !function utils.process_results_mmlu
+generation_kwargs:
+  until:
+    - "<|im_end|>"
+    - "<|endoftext|>"
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16384
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

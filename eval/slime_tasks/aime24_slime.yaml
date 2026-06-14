@@ -1,0 +1,28 @@
+task: aime24_slime
+# AIME 2024 zero-shot CoT — chat completion, mimicking slime deepscaler reward.
+# Parsing: strips </think>, extracts \boxed{}, grades with mathd_normalize.
+#          (slime/rollout/rm_hub/deepscaler.py + math_utils.py)
+# Model: local-chat-completions, no system prompt.
+dataset_path: Maxwell-Jia/AIME_2024
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: train
+num_fewshot: 0
+doc_to_text: !function utils.doc_to_text_aime24
+doc_to_target: "{{Answer}}"
+process_results: !function utils.process_results_math
+generation_kwargs:
+  until:
+    - "<|im_end|>"
+    - "<|endoftext|>"
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

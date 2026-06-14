@@ -1,0 +1,33 @@
+task: gpqa_slime
+# GPQA Diamond zero-shot CoT — chat completion, mimicking slime gpqa.py reward logic.
+# Parsing order (utils.py::_extract_letter_from_response):
+#   1. strict patterns: "answer is X", "X is correct", "final answer X"
+#   2. \boxed{X}                ← preferred final-answer format (this prompt asks for it)
+#   3. last standalone capital letter A-D (bare-letter fallback)
+# Model: local-chat-completions, no system prompt.
+dataset_path: Idavidrein/gpqa
+dataset_name: gpqa_diamond
+tag: gpqa
+output_type: generate_until
+process_docs: !function utils.process_docs_gpqa
+training_split: train
+validation_split: train
+test_split: null
+num_fewshot: 0
+doc_to_text: "Answer the following multiple choice question. Think step by step, then put your final answer letter inside \\boxed{}, e.g. \\boxed{A}.\n\nQuestion: {{Question}}\n(A) {{choice1}}\n(B) {{choice2}}\n(C) {{choice3}}\n(D) {{choice4}}"
+doc_to_target: answer
+process_results: !function utils.process_results_gpqa
+generation_kwargs:
+  until:
+    - "<|im_end|>"
+    - "<|endoftext|>"
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16384
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

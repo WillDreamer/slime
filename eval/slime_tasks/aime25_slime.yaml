@@ -1,0 +1,23 @@
+task: aime25_slime
+# AIME 2025 zero-shot CoT — chat completion, mimicking slime deepscaler reward.
+dataset_path: math-ai/aime25
+output_type: generate_until
+test_split: test
+num_fewshot: 0
+doc_to_text: !function utils.doc_to_text_aime25
+doc_to_target: "{{answer}}"
+process_results: !function utils.process_results_math
+generation_kwargs:
+  until:
+    - "<|im_end|>"
+    - "<|endoftext|>"
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
