@@ -144,7 +144,7 @@ def _build_input_example(metadata: JsonDict) -> InputExample | None:
     kwargs_list = _coerce_kwargs_list(raw_kwargs, len(instruction_ids))
 
     return InputExample(
-        key=int(metadata.get("record_id") or 0),
+        key=hash(metadata.get("record_id") or 0) & 0xFFFFFFFF,
         instruction_id_list=instruction_ids,
         prompt=prompt_text,
         kwargs=kwargs_list,

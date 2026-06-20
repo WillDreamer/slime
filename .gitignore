@@ -3,6 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# --- ifbench / eval bundle: exclude bulk that must be obtained separately ---
+# Large IFBench training data (~225M, >GitHub 100MB limit). Regenerate via the
+# original examples/ifbench/download_and_convert.py. The small eval set
+# (IFBench_eval.jsonl) IS committed.
+examples/ifbench/IF_multi_constraints_upto5_ifbench*.jsonl
+examples/ifbench/IF_multi_constraints_upto5_raw.jsonl
+# Third-party IFBench eval repo (auto-cloned by rm_hub/ifbench.py at runtime).
+/IFBench/
+# eval_scai runtime outputs
+eval_scai/results/
+eval_scai/logs/
+
 # C extensions
 *.so
 

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import re
 
 import aiohttp
 
@@ -52,6 +53,71 @@ async def remote_rm(args, sample: Sample, max_retries: int = 10):
             await asyncio.sleep(backoff)
 
 
+async def _query_rm_judge(url: str, prompt: str, response: str, max_retries: int = 5) -> float:
+    """Query a Skywork-Reward-style sglang /classify endpoint.
+
+    Input: prompt (already chat-template-formatted string from slime) + response text.
+    We reconstruct the conversation as [user, assistant] and format with Llama-3.1 template,
+    then POST to the sglang /classify endpoint.
+
+    The server returns: [{"embedding": [score]}] for a single input.
+    Falls back to 0.0 on failure so training isn't blocked.
+    """
+    session = _get_shared_session()
+
+    # The prompt is Qwen3 chat-template formatted. Extract raw user content.
+    # Format: "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+    user_match = re.search(r"<\|im_start\|>user\n(.*?)<\|im_end\|>", prompt, re.DOTALL)
+    raw_prompt = user_match.group(1) if user_match else prompt
+
+    # Build Llama-3.1 chat template for the Skywork reward model.
+    # NOTE: Do NOT include <|begin_of_text|> — sglang adds BOS automatically.
+    conv_text = (
+        f"<|start_header_id|>user<|end_header_id|>\n\n"
+        f"{raw_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{response}<|eot_id|>"
+    )
+
+    # Send as a single string (not list) so sglang returns a single dict response.
+    payload = {"text": conv_text}
+    for attempt in range(max_retries):
+        try:
+            async with session.post(url, json=payload) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+                # sglang /classify with text=str returns {"embedding": [score], "meta_info": {...}}
+                if isinstance(result, dict) and "embedding" in result:
+                    return float(result["embedding"][0])
+                # Batch response fallback: [{"embedding": [score], ...}]
+                elif isinstance(result, list) and result:
+                    return float(result[0].get("embedding", [0.0])[0])
+                logger.warning(f"rm_judge unexpected response format: {str(result)[:200]}")
+                return 0.0
+        except Exception as e:
+            if attempt + 1 >= max_retries:
+                logger.warning(f"rm_judge failed after {max_retries} attempts: {e}. Returning 0.0")
+                return 0.0
+            backoff = min(2**attempt, 10) + random.random()
+            await asyncio.sleep(backoff)
+    return 0.0
+
+
+def _apply_rm_judge_reward(verified_reward: float, rm_score: float, threshold: float) -> float:
+    """Combine verified reward with RM judge score.
+
+    Logic:
+      - If verified > 0 and rm_score > threshold:  final = verified + 1
+      - If verified > 0 and rm_score <= threshold: final = verified - 0.5
+      - If verified <= 0:                          final = verified (unchanged)
+    """
+    if verified_reward > 0:
+        if rm_score > threshold:
+            return verified_reward + 1.0
+        else:
+            return verified_reward - 0.5
+    return verified_reward
+
+
 async def async_rm(args, sample: Sample, **kwargs):
     if args.custom_rm_path is not None:
         rm_function = load_function(args.custom_rm_path)
@@ -79,6 +145,16 @@ async def async_rm(args, sample: Sample, **kwargs):
         return f1_score(response, label)[0]
     elif rm_type == "gpqa":
         return compute_gpqa_reward(response, label, metadata=metadata)
+    elif rm_type in ("ifeval", "multi"):
+        from .ifeval import compute_ifeval_reward
+
+        verified = compute_ifeval_reward(response, label, metadata=metadata)
+        rm_judge_url = getattr(args, "rm_judge_url", None)
+        if rm_judge_url and verified > 0:
+            rm_score = await _query_rm_judge(rm_judge_url, sample.prompt, response)
+            threshold = getattr(args, "rm_judge_threshold", 0.0)
+            return _apply_rm_judge_reward(verified, rm_score, threshold)
+        return verified
     elif rm_type == "ifbench":
         from .ifbench import compute_ifbench_reward
 

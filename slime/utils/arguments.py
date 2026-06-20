@@ -1236,6 +1236,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rm-judge-url",
+                type=str,
+                default=None,
+                help=(
+                    "URL of an sglang/vllm server to use as a generative reward model judge. "
+                    "When set, responses with verified_reward > 0 are additionally scored by "
+                    "this RM and the final reward is adjusted based on --rm-judge-threshold."
+                ),
+            )
+            parser.add_argument(
+                "--rm-judge-threshold",
+                type=float,
+                default=0.5,
+                help=(
+                    "Threshold (alpha) for the RM judge score. "
+                    "If verified > 0 and rm_score > alpha: final = verified + 1. "
+                    "If verified > 0 and rm_score <= alpha: final = verified - 0.5. "
+                    "If verified <= 0: final = verified (unchanged). Default: 0.5"
+                ),
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,
