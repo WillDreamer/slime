@@ -60,7 +60,21 @@ class RolloutDataSource(DataSource):
 
         if args.rollout_global_dataset and args.prompt_data is not None:
             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-            processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+            # Only build a multimodal processor when the run actually declares
+            # multimodal data (--multimodal-keys). Otherwise a text-only run on a
+            # checkpoint that merely SHIPS image/video preprocessor configs (e.g.
+            # Qwen3.5-4B-Base has preprocessor_config.json + video_preprocessor_
+            # config.json) would get a non-None ProcessorMixin from
+            # load_processor(), which then forces Dataset() down the
+            # `assert isinstance(prompt, list)` path in utils/data.py and crashes
+            # any non-conversation prompt (tau-bench uses a bare int task `index`
+            # with --input-key index and no --apply-chat-template). VLM examples
+            # all pass --multimodal-keys, so this gate is safe for them.
+            processor = (
+                load_processor(args.hf_checkpoint, trust_remote_code=True)
+                if args.multimodal_keys is not None
+                else None
+            )
 
             # TODO move (during the refactor)
             if (d := args.dump_details) is not None:

@@ -10,30 +10,76 @@ import logging
 import os
 from typing import Any
 
-from tau_bench.envs import get_env
+from async_env import get_async_env
 from tau_bench.types import RunConfig
 from trainable_agents import InteractionResult, Status, agent_factory
 
 from slime.utils.types import Sample
+from slime.rollout.sglang_rollout import get_model_url
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
 
-# Tau-bench configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Tau-bench configuration (AECE / Greenland).
+#
+# The user simulator is selected by TAU_USER_STRATEGY:
+#   "claude" — Bedrock Claude (boto3, cross-region; no external API/key). The
+#              model id / region come from TAU_USER_MODEL_ID / TAU_BEDROCK_REGION
+#              (read in tau_bench/envs/user.py::BedrockClaudeUserSimulationEnv).
+#   "local"  — a model served IN-CLUSTER over an OpenAI-compatible HTTP endpoint
+#              (e.g. GLM-flash on a dedicated node, launched by slime as a second
+#              entry in --sglang-config). No external egress at all. The endpoint
+#              is resolved at run time from the live SGLang router and published
+#              via TAU_USER_SIM_URL (see generate() below); the served model name
+#              comes from TAU_USER_MODEL_ID. Read in user.py::LocalUserSimulationEnv.
+#
+# Everything here is overridable via env so the run script is the single source
+# of truth (no code edits to switch env/split/user-model):
+#   TAU_ENV            retail | airline                       (default retail)
+#   TAU_TASK_SPLIT     train | test | dev                     (default train)
+#   TAU_USER_STRATEGY  claude | local | llm | react | ...     (default claude)
+#   TAU_USER_MODEL_ID  Bedrock model id (claude) OR served model name (local);
+#                      mirrored into RunConfig.user_model.
+#   TAU_USER_SIM_MODEL named model in --sglang-config to route to (local; default
+#                      "user_sim"); used to resolve the router URL from args.
+#   TAU_USER_SIM_URL   explicit endpoint override (local). If unset, generate()
+#                      fills it from the live router; if set, it wins (single-node
+#                      tests / self-launched servers).
+# model / model_provider are UNUSED by our SGLang rollout path but RunConfig
+# requires them, so we keep placeholder values.
+# ─────────────────────────────────────────────────────────────────────────────
 TAU_CONFIGS = {
-    "env": "retail",  # Select between ["retail", "airline"]
-    "agent": "tool-calling",  # Select between ["tool-calling", "act", "react", "few-shot"]
-    "user_model": "gemini-2.5-flash-lite",  # Cheap Model for user simulator
-    "task_split": "train",  # Select between ["train", "test", "dev"] for retail
-    "user_strategy": "llm",  # Select between ["llm", "react", "verify", "reflection"]
-    "model_provider": "auto_router",  # Unused, required
-    "model": "qwen3-4b",  # Unused, required
-    "user_model_provider": "gemini",
+    "env": os.environ.get("TAU_ENV", "retail"),
+    "agent": "tool-calling",  # only tool-calling is implemented for training
+    "user_model": os.environ.get("TAU_USER_MODEL_ID", "us.anthropic.claude-opus-4-7"),
+    "task_split": os.environ.get("TAU_TASK_SPLIT", "train"),
+    "user_strategy": os.environ.get("TAU_USER_STRATEGY", "claude"),
+    "model_provider": "auto_router",  # Unused, required by RunConfig
+    "model": "qwen3.5-4b",  # Unused, required by RunConfig
+    "user_model_provider": "bedrock",  # informational; CLAUDE/LOCAL strategies ignore it
 }
-# Replace with your actual API key for user sim
-GEMINI_API_KEY = "NONE"
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 tau_config = RunConfig(**TAU_CONFIGS)
+
+
+def _ensure_user_sim_url(args) -> None:
+    """For the LOCAL user-sim, publish the live SGLang router URL via env.
+
+    slime assigns the user-sim model's router port dynamically at launch, so we
+    cannot hardcode it. The named-model router map lives on `args`
+    (args.sglang_model_routers, populated by start_rollout_servers); resolve it
+    once here with get_model_url and stash it in TAU_USER_SIM_URL so the env
+    construction chain (which has no access to `args`) can read it. An explicit
+    TAU_USER_SIM_URL set by the operator always wins (idempotent: only fills it
+    when empty)."""
+    if tau_config.user_strategy != "local":
+        return
+    if os.environ.get("TAU_USER_SIM_URL"):
+        return
+    model_name = os.environ.get("TAU_USER_SIM_MODEL", "user_sim")
+    url = get_model_url(args, model_name, "/v1/chat/completions")
+    os.environ["TAU_USER_SIM_URL"] = url
+    logger.info(f"Resolved local user-sim endpoint for model '{model_name}': {url}")
 
 
 def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
@@ -53,11 +99,11 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
     """
     # Map tau-bench status to slime status
     status_mapping = {
-        Status.COMPLETED: "completed",
-        Status.TRUNCATED: "truncated",
-        Status.ABORTED: "aborted",
+        Status.COMPLETED: Sample.Status.COMPLETED,
+        Status.TRUNCATED: Sample.Status.TRUNCATED,
+        Status.ABORTED: Sample.Status.ABORTED,
     }
-    status = status_mapping.get(res.status)
+    status = status_mapping.get(res.status, Sample.Status.ABORTED)
 
     # Debug logging for response tracking
     logger.debug(
@@ -77,7 +123,16 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
         loss_mask=res.loss_mask,
         status=status,
         metadata=res.info,
+        rollout_log_probs=res.rollout_log_probs,
     )
+
+    # Truncated trajectories: keep them in the batch with a clearly negative
+    # reward instead of dropping. Magnitude (-0.2) is set so truncation is
+    # *worse* than a format-bad failure (-0.1); otherwise the model finds it
+    # cheaper to keep thinking until the length cap fires than to emit an
+    # imperfect tool_call, which directly drives CoT longer.
+    if status == Sample.Status.TRUNCATED:
+        sample.reward = -0.2
 
     # Ensure response_length is set correctly
     if hasattr(res, "response_length"):
@@ -123,8 +178,13 @@ async def generate(args: dict[str, Any], sample: Sample, sampling_params: dict) 
     task_index = int(sample.prompt)
     logger.info(f"Starting agent-environment interaction for task {task_index}")
 
-    # Initialize tau-bench environment
-    env = get_env(
+    # For the local user-sim, resolve the in-cluster SGLang router URL from args
+    # and publish it via TAU_USER_SIM_URL (no-op for the Bedrock/claude path).
+    _ensure_user_sim_url(args)
+
+    # Initialize tau-bench environment (async wrapper around the sync env so the
+    # blocking user-sim call runs in a worker thread, not on the loop).
+    env = get_async_env(
         env_name=tau_config.env,
         user_strategy=tau_config.user_strategy,
         user_model=tau_config.user_model,

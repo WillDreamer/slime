@@ -514,7 +514,17 @@ async def eval_rollout_single_dataset(
     cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-        processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+        # Only build a multimodal processor when the run declares multimodal data
+        # (--multimodal-keys); otherwise a text-only eval set on a checkpoint that
+        # merely ships image/video preprocessor configs (e.g. Qwen3.5-4B-Base)
+        # would force Dataset() down the `assert isinstance(prompt, list)` path
+        # and crash bare-int prompts (tau-bench eval uses --input-key index). Same
+        # gate as RolloutDataSource in rollout/data_source.py.
+        processor = (
+            load_processor(args.hf_checkpoint, trust_remote_code=True)
+            if args.multimodal_keys is not None
+            else None
+        )
         EVAL_PROMPT_DATASET[cache_key] = Dataset(
             path=dataset_cfg.path,
             tokenizer=tokenizer,

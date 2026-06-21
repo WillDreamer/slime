@@ -517,6 +517,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 help="Whether to keep the rollout model on training process",
             )
+            # NOTE: --save-retain-interval is defined by Megatron upstream
+            # (_add_checkpointing_args; type=int, default=None, validated to be a
+            # multiple of --save-interval). slime parses on top of the Megatron
+            # parser, so re-adding it here raises argparse "conflicting option
+            # string" and crashes train.py at startup (killed job c9b3d8dc). The
+            # checkpoint-retention prune in train.py reads it via
+            # getattr(args, "save_retain_interval", None), so Megatron's native
+            # arg feeds it directly — no slime-side definition needed.
 
             parser.add_argument(
                 "--rollout-data-postprocess-path",

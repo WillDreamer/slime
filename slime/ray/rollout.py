@@ -1247,6 +1247,15 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            # Log per data_source when samples carry metadata["data_source"] (e.g. mixed
+            # eval set) — gives per-source eval reward breakdown. Ported from upstream.
+            data_source_rewards = {}
+            for sample, reward in zip(samples, rewards):
+                ds = (getattr(sample, "metadata", None) or {}).get("data_source", None)
+                if ds is not None:
+                    data_source_rewards.setdefault(ds, []).append(reward)
+            for ds, ds_rewards in data_source_rewards.items():
+                log_dict[f"eval/{ds}"] = sum(ds_rewards) / len(ds_rewards)
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -1297,6 +1306,75 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
+
+    # Multi-turn / tool-use / agent-trajectory metrics (ported from upstream slime).
+    # Each is guarded by `if <list>:` so it only logs when the rollout generator
+    # populates the corresponding sample.metadata[...] field (e.g. tau-bench env,
+    # multi-turn tool-use). Self-contained — uses compute_statistics/dict_add_prefix
+    # already imported above. Logged under both rollout/* (train) and eval/<key>/*.
+    # Log multi-turn interaction statistics if available
+    turn_counts = [s.metadata.get("num_turns") for s in samples if s.metadata.get("num_turns") is not None]
+    if turn_counts:
+        log_dict |= dict_add_prefix(compute_statistics(turn_counts), "num_turns/")
+
+    # Log tool calling and format metrics if available
+    valid_formats = [s.metadata.get("valid_format") for s in samples if s.metadata.get("valid_format") is not None]
+    if valid_formats:
+        log_dict["valid_format_rate"] = np.mean(valid_formats).item()
+
+    tool_calls = [s.metadata.get("has_tool_call") for s in samples if s.metadata.get("has_tool_call") is not None]
+    if tool_calls:
+        log_dict["tool_call_rate"] = np.mean(tool_calls).item()
+
+    tool_call_turn_fracs = [
+        s.metadata.get("tool_call_turn_frac") for s in samples if s.metadata.get("tool_call_turn_frac") is not None
+    ]
+    if tool_call_turn_fracs:
+        log_dict["tool_call_turn_frac"] = np.mean(tool_call_turn_fracs).item()
+
+    answer_corrects = [s.metadata.get("answer_correct") for s in samples if s.metadata.get("answer_correct") is not None]
+    if answer_corrects:
+        log_dict["answer_correct_rate"] = np.mean(answer_corrects).item()
+
+    retrieval_corrects = [
+        s.metadata.get("retrieval_correct") for s in samples if s.metadata.get("retrieval_correct") is not None
+    ]
+    if retrieval_corrects:
+        log_dict["retrieval_correct_rate"] = np.mean(retrieval_corrects).item()
+
+    # Log void masking metrics if available
+    void_masked_vals = [s.metadata.get("void_masked") for s in samples if s.metadata.get("void_masked") is not None]
+    if void_masked_vals:
+        log_dict["void_mask_rate"] = np.mean(void_masked_vals).item()
+
+    # Multi-turn agent metrics (tau-bench and similar envs): distributions
+    # over per-trajectory counts plus rates for env-done / abort.
+    num_tool_calls_list = [
+        s.metadata.get("num_tool_calls") for s in samples if s.metadata.get("num_tool_calls") is not None
+    ]
+    if num_tool_calls_list:
+        log_dict |= dict_add_prefix(compute_statistics(num_tool_calls_list), "num_tool_calls/")
+
+    num_respond_list = [
+        s.metadata.get("num_respond_turns") for s in samples if s.metadata.get("num_respond_turns") is not None
+    ]
+    if num_respond_list:
+        log_dict |= dict_add_prefix(compute_statistics(num_respond_list), "num_respond_turns/")
+
+    num_length_trunc_list = [
+        s.metadata.get("num_length_trunc") for s in samples if s.metadata.get("num_length_trunc") is not None
+    ]
+    if num_length_trunc_list:
+        log_dict["length_trunc_rate"] = np.mean([int(x > 0) for x in num_length_trunc_list]).item()
+
+    env_done_vals = [s.metadata.get("env_done") for s in samples if s.metadata.get("env_done") is not None]
+    if env_done_vals:
+        log_dict["env_done_rate"] = np.mean(env_done_vals).item()
+
+    aborted_vals = [s.metadata.get("is_aborted") for s in samples if s.metadata.get("is_aborted") is not None]
+    if aborted_vals:
+        log_dict["aborted_rate"] = np.mean(aborted_vals).item()
+
     return log_dict
 
 

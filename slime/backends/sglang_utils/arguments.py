@@ -27,6 +27,26 @@ def add_sglang_router_arguments(parser):
         default=14400,
         help="Timeout for requests to the SGLang router in seconds",
     )
+    # dest=router_policy (no sglang_ prefix) so it is consumed BOTH by
+    # RouterArgs.from_cli_args(args, use_router_prefix=True) — which reads
+    # router_*-prefixed attrs to set the live router's load-balancing policy —
+    # AND by the rollout header logic that gates X-SMG-Routing-Key on
+    # getattr(args, "router_policy", None) == "consistent_hashing".
+    # Default "cache_aware" matches the router's own implicit default, so runs
+    # that do not pass this flag are byte-for-byte unchanged.
+    parser.add_argument(
+        "--router-policy",
+        type=str,
+        default="cache_aware",
+        help=(
+            "SGLang router load-balancing policy. 'cache_aware' (default) routes "
+            "by current prefix-cache state; 'consistent_hashing' enables SESSION "
+            "AFFINITY — every request carrying the same X-SMG-Routing-Key (slime "
+            "sets it from sample.session_id) is hashed to the same worker, so all "
+            "turns of one multi-turn trajectory reuse that worker's prefix cache; "
+            "'round_robin' ignores cache. The router validates the final value."
+        ),
+    )
     return parser
 
 
