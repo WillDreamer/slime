@@ -10,7 +10,7 @@ set -o pipefail
 IMG=slimerl/slime:latest
 CON=tau2run
 HOME_EC2=/home/ec2-user
-DATA=$HOME_EC2/tau2_data            # persistent sim data on the live root
+TAU2DIR=$HOME_EC2/tau2-bench         # tau2-bench code+data+patches, on the live root
 log(){ echo "[$(date -u +%FT%TZ)] [tau2-resume] $*"; }
 port_bound(){ timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 
@@ -19,7 +19,6 @@ docker info >/dev/null 2>&1 || { log "FATAL: docker down"; exit 1; }
 docker image inspect "$IMG" >/dev/null 2>&1 || { log "pulling $IMG"; docker pull "$IMG"; }
 
 # (1) container -------------------------------------------------------------
-mkdir -p "$DATA"
 if docker ps --format '{{.Names}}' | grep -qx "$CON"; then log "$CON running";
 elif docker ps -a --format '{{.Names}}' | grep -qx "$CON"; then log "starting $CON"; docker start "$CON" >/dev/null;
 else
@@ -28,12 +27,19 @@ else
     --ulimit memlock=-1 --ulimit stack=67108864 --restart unless-stopped \
     -v "$HOME_EC2/slime:$HOME_EC2/slime" \
     -v "$HOME_EC2/hf_cache:/root/.cache/huggingface" \
-    -v "$DATA:$HOME_EC2/tau2-bench/data" \
+    -v "$TAU2DIR:$HOME_EC2/tau2-bench" \
     "$IMG" sleep infinity >/dev/null
 fi
 
 # (2) tau deps + patches (idempotent) ---------------------------------------
 docker exec "$CON" bash -lc "$HOME_EC2/slime/aws/_setup_tau_deps.sh" >>/tmp/tau2_setup.log 2>&1 || log "WARN: setup_tau_deps issue"
+
+# (2b) wait until the container can actually see the GPUs (guards the stop->start
+# GPU-release race and the post-daemon-reload NVML hiccup).
+for i in $(seq 1 30); do
+  docker exec "$CON" bash -lc 'python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count()>=8 else 1)"' 2>/dev/null && break
+  log "GPUs not ready in container yet ($i)..."; sleep 5
+done
 
 # (3) launch 8 servers ------------------------------------------------------
 # port|gpu|model|served_name|mem|extra
@@ -73,6 +79,7 @@ log "servers up."
 if docker exec "$CON" bash -lc 'pgrep -f "[r]un_tau2_resume_all.sh" >/dev/null'; then
   log "eval already running — not relaunching."
 else
+  docker exec "$CON" bash -lc "mkdir -p $HOME_EC2/slime/eval_scai/logs/tau2_rp $HOME_EC2/slime/eval_scai/tau2_rp_results"
   docker exec -d "$CON" bash -lc "cd $HOME_EC2/slime/eval_scai && nohup bash run_tau2_resume_all.sh > logs/tau2_rp/MASTER_resume.log 2>&1"
   log "tau2 resume-all (re)launched -> eval_scai/logs/tau2_rp/MASTER_resume.log"
 fi
