@@ -62,7 +62,7 @@ case "${BENCH}" in
     [ -n "${TAU2_MESSAGE_LIMIT}" ] && EXTRA+=(-T "message_limit=${TAU2_MESSAGE_LIMIT}")
     for domain in ${TAU2_DOMAINS}; do
         "${INSPECT_BIN}" eval "inspect_evals/tau2_${domain}" "${COMMON[@]}" \
-            --temperature "${INSPECT_TEMPERATURE}" "${EXTRA[@]}" "$@"
+            --temperature "${TAU2_TEMPERATURE}" "${EXTRA[@]}" "$@"
     done
     ;;
   *)

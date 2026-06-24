@@ -207,3 +207,6 @@ _examples_synced/
 .DS_Store
 
 data/
+
+# BrowseComp-Plus checkout + assets (large; provisioned locally)
+eval_scai/benchmarks/browsecomp_plus/BrowseComp-Plus/

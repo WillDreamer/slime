@@ -1,0 +1,28 @@
+# Auto-bring-up the Search-R1 EVAL (model servers + retrievers + 12-run eval)
+# after every spot stop/start. Install once (root volume persists it):
+#   sudo cp /home/ec2-user/slime/aws/searcheval.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable searcheval        # enable only; starts on next boot
+# Test now without rebooting:  sudo systemctl start searcheval
+# Watch:                       tail -f /home/ec2-user/Search_data/eval_all.log
+# Disable:                     sudo systemctl disable searcheval
+[Unit]
+Description=Search-R1 eval auto-resume (model servers + retrievers + eval) after spot stop/start
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ec2-user
+Environment=HOME=/home/ec2-user
+WorkingDirectory=/home/ec2-user/slime
+ExecStart=/home/ec2-user/slime/aws/autostart-resume.sh
+# Setup runs here and returns once the eval is (re)launched; the long index
+# loads happen synchronously inside wait-ready, so allow up to 30 min.
+KillMode=process
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

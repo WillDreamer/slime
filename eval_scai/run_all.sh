@@ -1,11 +1,14 @@
 #!/bin/bash
 # ============================================================================
-# Unified benchmark runner: evaluate one HF checkpoint on all 8 benchmarks.
+# Unified benchmark runner: evaluate one HF checkpoint on all 9 benchmarks.
 #
-#   GPQA | MMLU | AIME | BrowseComp-Plus | Search | Tau2 | IFBench | IFEval
+#   GPQA | MMLU | AIME | BrowseComp-Plus | Search | Tau1 | Tau2 | IFBench | IFEval
+#
+# Tau1 = training-aligned tau-bench v1 (reuses generate_with_tau.generate);
+# Tau2 = tau2-bench via inspect-ai. Both run by default.
 #
 # Usage:
-#   CKPT=/path/to/hf_checkpoint bash run_all.sh                  # all 8
+#   CKPT=/path/to/hf_checkpoint bash run_all.sh                  # all 9
 #   CKPT=... bash run_all.sh gpqa aime ifbench                   # a subset
 #
 # Common overrides (see env.sh for the full list):
@@ -23,7 +26,7 @@ set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
-ALL_BENCHMARKS=(gpqa mmlu aime ifeval tau2 ifbench search browsecomp)
+ALL_BENCHMARKS=(gpqa mmlu aime ifeval tau1 tau2 ifbench search browsecomp)
 BENCHMARKS=("${@}")
 [ ${#BENCHMARKS[@]} -eq 0 ] && BENCHMARKS=("${ALL_BENCHMARKS[@]}")
 
@@ -46,6 +49,12 @@ for b in "${BENCHMARKS[@]}"; do
     case "${b}" in
       gpqa|mmlu|aime|ifeval|tau2)
         bash "${SCRIPT_DIR}/benchmarks/inspect/run_inspect.sh" "${b}" \
+            2>&1 | tee "${LOG_DIR}/${b}.log"
+        rc=${PIPESTATUS[0]}
+        ;;
+      tau1)
+        # training-aligned tau-bench v1 (reuses generate_with_tau.generate)
+        bash "${SCRIPT_DIR}/benchmarks/tau/run_tau.sh" \
             2>&1 | tee "${LOG_DIR}/${b}.log"
         rc=${PIPESTATUS[0]}
         ;;

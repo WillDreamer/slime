@@ -41,6 +41,13 @@ def collect(model_dir):
                     for s in log.results.scores:
                         if mkey in s.metrics:
                             vals.setdefault(label, []).append(s.metrics[mkey].value)
+        # tau1 (training-aligned tau-bench v1): runN/tau1_<env>.json
+        for p in glob.glob(os.path.join(run_dir, "tau1_*.json")):
+            env = os.path.basename(p)[len("tau1_"):-len(".json")]
+            try:
+                vals.setdefault(f"tau1_{env}", []).append(json.load(open(p))["summary"]["accuracy"])
+            except Exception:
+                pass
         # ifbench
         p = os.path.join(run_dir, "ifbench.json")
         if os.path.exists(p):
@@ -67,6 +74,7 @@ def fmt(xs):
 
 
 ORDER = ["gpqa", "aime", "ifeval", "ifbench", "search_em", "mmlu", "browsecomp",
+         "tau1_retail", "tau1_airline",
          "tau2_retail", "tau2_airline", "tau2_telecom"]
 models = sorted(glob.glob(os.path.join(ROOT, "*")))
 rows = {os.path.basename(m): collect(m) for m in models if os.path.isdir(m)}

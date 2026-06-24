@@ -45,12 +45,36 @@ Usage:
 #  6. No INVALID_ACTION_OBS is injected on an unparseable action — the rollout
 #     simply re-prompts the assistant, matching the training loop.
 #  7. A context window (context_window_k=2) compresses older <tool_response>
-#     blocks, exactly like MessageContextWindowManager. With --max-turns <= 2
-#     this never triggers, so the canonical eval is unaffected.
+#     blocks, exactly like MessageContextWindowManager. Only used by the LEGACY
+#     --context-format; the default 'chat' format renders all results in full.
 #
-# Knob to watch: the training config uses max_turns=5; this harness defaults to
-# --max-turns 2 (matches the RL *eval* cadence). Set --max-turns 5 to match the
-# training rollout depth exactly.
+# CONTEXT FORMAT (--context-format, default 'chat'):
+#   The 8B Search/Tau checkpoints were trained with
+#   generate_with_search_tools_qwen_sft_no_drift.generate, which delegates ALL
+#   turn-wrapping to tokenizer.apply_chat_template — every assistant turn is
+#   closed with <|im_end|> and each tool result is a proper <|im_start|>user
+#   turn. The original string-concat path (now --context-format legacy) omitted
+#   the <|im_end|> between assistant and the tool_response, shifting every
+#   observation token by 1 after turn 1; the model fell off-distribution on
+#   multi-turn / hard questions and stopped emitting <tool_call>/<answer>.
+#   'chat' (render_chat) reproduces the no_drift construction byte-for-byte.
+#   Use 'legacy' only for the 30B checkpoints trained on the non-no_drift fn.
+#
+# FORCED FINAL ANSWER (--force-final-answer, default on):
+#   Neither the eval nor the training rollout forces an answer (training only
+#   shaped it via reward). A search-happy model (e.g. the Tau-SFT one) that
+#   spends all max_turns searching, or one that rambles to the length cap, ends
+#   with no <answer> and is floored to EM 0. After the loop, one constrained
+#   turn (stop=</answer>, in-format nudge) lets it conclude. The summary reports
+#   answered_rate / answered_only_em / forced_answer_rate so the floor is visible.
+#
+# TOKEN BUDGET (--max-response-tokens, default 4096):
+#   Total response tokens across ALL turns, matching training
+#   --rollout-max-response-len 4096. Per-turn max_new_tokens is clamped to the
+#   remaining budget so the model can't monologue past what it saw in training.
+#
+# Knob to watch: --max-turns defaults to 5 (training rollout depth, matches
+# SEARCH_R1_CONFIGS['max_turns']=5).
 # =============================================================================
 """
 
@@ -92,6 +116,25 @@ def parse_args():
     p.add_argument("--trajectory-output", default=None,
                    help="if set, write per-question full trajectory (prompt + multi-turn "
                         "tool_call/tool_response/answer response + gold) to this jsonl path")
+    # ---- train/eval alignment knobs (see module docstring NOTE) --------------
+    p.add_argument("--context-format", choices=["chat", "legacy"], default="chat",
+                   help="how the multi-turn context is rebuilt each turn. 'chat' "
+                        "re-renders the whole conversation via tokenizer.apply_chat_template "
+                        "(assistant turns closed with <|im_end|>, tool results as proper user "
+                        "turns) — byte-aligned with generate_with_search_tools_qwen_sft_no_drift, "
+                        "which the 8B checkpoints were trained with. 'legacy' is the old "
+                        "string-concat path (no <|im_end|> between assistant and tool_response) "
+                        "matching generate_with_search_tools_qwen_sft (the 30B training).")
+    p.add_argument("--force-final-answer", dest="force_final_answer",
+                   action="store_true", default=True,
+                   help="if the rollout ends (turn budget / length) without an <answer>, do one "
+                        "extra constrained generation (stop=</answer>) so a search-happy model "
+                        "still produces a final answer instead of being floored to EM 0 (default on)")
+    p.add_argument("--no-force-final-answer", dest="force_final_answer", action="store_false")
+    p.add_argument("--max-response-tokens", type=int, default=4096,
+                   help="total response-token budget across ALL turns (matches training "
+                        "--rollout-max-response-len 4096). Per-turn max_new_tokens is clamped to "
+                        "the remaining budget. 0 = unlimited (per-turn cap only).")
     return p.parse_args()
 
 
@@ -324,6 +367,50 @@ def build_context(prompt_text: str, turns: list[dict], args, add_final_generatio
     return context
 
 
+# Forced-answer nudge injected as a final user turn when the rollout would
+# otherwise end without an <answer>. Deliberately contains NO literal
+# <answer>/</answer> tags: extract_solution() counts <answer> occurrences and
+# returns the LAST one only when >=2 exist (the instruction's "<answer> Beijing
+# </answer>" example is the baseline), so injecting tags here would pollute that
+# count. The trained model emits the <answer>...</answer> wrapper on its own.
+FORCE_ANSWER_NUDGE = (
+    "You have used all available searches and cannot search further. "
+    "Based on the information gathered so far, give your final answer now."
+)
+
+
+def render_chat(tokenizer, tools, base_messages, turns, add_generation_prompt=True,
+                final_user=None):
+    """No-drift context construction: re-render the WHOLE conversation through
+    tokenizer.apply_chat_template every turn (mirrors
+    generate_with_search_tools_qwen_sft_no_drift.ChatTemplateConversationManager
+    with strip_think=False / SEARCH_R1_STRIP_THINK=0).
+
+    Each accumulated turn becomes an assistant message (verbatim model text,
+    think included) followed — when it issued a search — by a user message whose
+    content is the already-wrapped <tool_response>...</tool_response>. This is
+    byte-identical to the trained rollout, so the model stays in-distribution and
+    keeps emitting <tool_call>/<answer> on multi-turn / hard questions. Unlike the
+    legacy path there is no rolling compression: search results render in full.
+
+    final_user, if given, is appended as a trailing user turn (used by the
+    forced-answer step) before the generation prompt.
+    """
+    msgs = [dict(m) for m in base_messages]
+    for t in turns:
+        msgs.append({"role": "assistant", "content": t["text"]})
+        if t["search_result"] is not None:
+            msgs.append({
+                "role": "user",
+                "content": f"<tool_response>\n{t['search_result']}\n</tool_response>",
+            })
+    if final_user is not None:
+        msgs.append({"role": "user", "content": final_user})
+    return tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=add_generation_prompt, tools=tools
+    )
+
+
 async def retrieve(session, sem, url, query, topk):
     payload = {"queries": [query], "topk": topk, "return_scores": True}
     async with sem:
@@ -339,34 +426,74 @@ async def retrieve(session, sem, url, query, topk):
                 await asyncio.sleep(2**attempt)
 
 
-async def run_sample(session, gen_sem, ret_sem, args, prompt_text):
-    """One multi-turn tool-call rollout. Returns the accumulated response string."""
+async def _generate(session, gen_sem, args, context, stop, max_new):
+    """POST to sglang /generate with retries. Returns the json output or None."""
+    payload = {
+        "text": context,
+        "sampling_params": {
+            "max_new_tokens": max_new,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "stop": stop,
+            "no_stop_trim": True,  # keep the matched stop tag in the output
+        },
+    }
+    for _attempt in range(5):
+        try:
+            async with gen_sem:
+                async with session.post(f"{args.base_url}/generate", json=payload) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+        except Exception as e:  # noqa: BLE001 — transient server disconnect / 5xx
+            if _attempt == 4:
+                print(f"[gen] sample failed after retries: {e}", file=sys.stderr)
+                return None
+            await asyncio.sleep(1.5 * (_attempt + 1))
+    return None
+
+
+async def run_sample(session, gen_sem, ret_sem, args, base_messages, tokenizer, tools, prompt_text):
+    """One multi-turn tool-call rollout.
+
+    Returns a dict: solution_str (full conversation text scored by the EM scorer),
+    response (trajectory suffix), answered (bool), forced (bool), n_turns (int).
+    """
     turns: list[dict] = []
+    used_tokens = 0
+
+    def build_ctx(add_gen=True, final_user=None):
+        if args.context_format == "chat":
+            return render_chat(tokenizer, tools, base_messages, turns, add_gen, final_user)
+        # legacy string-concat path (drift-y; matches the non-no_drift training)
+        return build_context(prompt_text, turns, args, add_final_generation_prompt=add_gen)
+
+    def remaining():
+        if args.max_response_tokens and args.max_response_tokens > 0:
+            return max(0, args.max_response_tokens - used_tokens)
+        return args.max_new_tokens
+
+    answered = False
     for _turn in range(args.max_turns):
-        context = build_context(prompt_text, turns, args, add_final_generation_prompt=True)
-        payload = {
-            "text": context,
-            "sampling_params": {
-                "max_new_tokens": args.max_new_tokens,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "stop": ["</tool_call>", "</answer>"],
-                "no_stop_trim": True,  # keep the matched stop tag in the output
-            },
-        }
-        async with gen_sem:
-            async with session.post(f"{args.base_url}/generate", json=payload) as resp:
-                resp.raise_for_status()
-                output = await resp.json()
+        budget = min(args.max_new_tokens, remaining())
+        if budget <= 0:
+            break
+        output = await _generate(session, gen_sem, args, build_ctx(add_gen=True),
+                                 ["</tool_call>", "</answer>"], budget)
+        if output is None:
+            break
 
         cur = postprocess_responses(output["text"])
-
-        if output["meta_info"]["finish_reason"]["type"] == "length":
-            turns.append({"text": cur, "search_result": None})
-            break
+        used_tokens += len(tokenizer(cur, add_special_tokens=False)["input_ids"])
+        finish = output["meta_info"]["finish_reason"]["type"]
 
         action, content = postprocess_predictions(cur)
         if action == "answer":
+            turns.append({"text": cur, "search_result": None})
+            answered = True
+            break
+        if finish == "length":
+            # ran out of per-turn / total budget mid-thought; stop (forced-answer
+            # step below gives it one constrained chance to conclude).
             turns.append({"text": cur, "search_result": None})
             break
         if action == "search":
@@ -382,10 +509,41 @@ async def run_sample(session, gen_sem, ret_sem, args, prompt_text):
             # matching the training rollout's behaviour.
             turns.append({"text": cur, "search_result": None})
 
-    # The scored solution string is prompt_text + this response (the harness
-    # rebuilds the no-trailing-prompt context, same as the training reward_func).
-    full_context = build_context(prompt_text, turns, args, add_final_generation_prompt=False)
-    return full_context[len(prompt_text):]
+    # ---- forced final answer -------------------------------------------------
+    # Neither the eval nor the training rollout *forces* an answer (training only
+    # shaped it via reward), so a model that searches on its last turn or rambles
+    # to the length cap ends with no <answer> and is floored to EM 0. Give it one
+    # constrained turn that may only answer (stop=</answer>), nudged in-format.
+    # Chat-format only — the legacy path can't append a clean trailing user turn.
+    forced = False
+    if (args.force_final_answer and not answered and args.context_format == "chat"
+            and turns):
+        # Dedicated budget independent of the (possibly exhausted) search budget —
+        # a model that spent all its tokens searching must still get to conclude.
+        ans_budget = min(args.max_new_tokens, 1024)
+        output = await _generate(
+            session, gen_sem, args,
+            build_ctx(add_gen=True, final_user=FORCE_ANSWER_NUDGE),
+            ["</answer>"], ans_budget,
+        )
+        if output is not None:
+            cur = output["text"]
+            if "</answer>" in cur:  # trim trailing only at the answer close
+                cur = cur.split("</answer>")[0] + "</answer>"
+            turns.append({"text": cur, "search_result": None})
+            forced = True
+            if "<answer>" in cur:
+                answered = True
+
+    solution_str = build_ctx(add_gen=False)
+    response = solution_str[len(prompt_text):] if solution_str.startswith(prompt_text) else solution_str
+    return {
+        "solution_str": solution_str,
+        "response": response,
+        "answered": answered,
+        "forced": forced,
+        "n_turns": len(turns),
+    }
 
 
 async def main():
@@ -405,14 +563,15 @@ async def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     tools = [SEARCH_TOOL_DESC]
+    base_messages_list = [
+        clean_instruction_in_messages([dict(m) for m in row["prompt"]])
+        for _, row in df.iterrows()
+    ]
     prompts = [
         tokenizer.apply_chat_template(
-            clean_instruction_in_messages([dict(m) for m in row["prompt"]]),
-            tokenize=False,
-            add_generation_prompt=True,
-            tools=tools,
+            bm, tokenize=False, add_generation_prompt=True, tools=tools
         )
-        for _, row in df.iterrows()
+        for bm in base_messages_list
     ]
 
     gen_sem = asyncio.Semaphore(args.concurrency)
@@ -420,29 +579,38 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=3600)
     t0 = time.time()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        responses = await asyncio.gather(
-            *[run_sample(session, gen_sem, ret_sem, args, p) for p in prompts]
+        results = await asyncio.gather(
+            *[run_sample(session, gen_sem, ret_sem, args, bm, tokenizer, tools, p)
+              for bm, p in zip(base_messages_list, prompts)]
         )
 
     traj_f = open(args.trajectory_output, "w") if args.trajectory_output else None
     per_ds_scores, details = defaultdict(list), []
-    for (_, row), prompt_text, response in zip(df.iterrows(), prompts, responses):
+    n_answered = n_forced = 0
+    answered_score_sum = 0.0
+    for (_, row), prompt_text, res in zip(df.iterrows(), prompts, results):
         gt = row["reward_model"]["ground_truth"]
         gt = {k: (list(v) if hasattr(v, "tolist") or isinstance(v, (list, tuple)) else v) for k, v in dict(gt).items()}
         # Same call as the RL reward_func, but format_score=0 -> pure EM metric.
         score = compute_score_em(
-            solution_str=prompt_text + response, ground_truth=gt, format_score=0
+            solution_str=res["solution_str"], ground_truth=gt, format_score=0
         )
+        n_answered += int(res["answered"])
+        n_forced += int(res["forced"])
+        if res["answered"]:
+            answered_score_sum += score
         ds = row.get("data_source", "unknown")
         per_ds_scores[ds].append(score)
-        details.append({"id": row.get("id"), "data_source": ds, "score": score})
+        details.append({"id": row.get("id"), "data_source": ds, "score": score,
+                        "answered": res["answered"], "forced": res["forced"]})
         if traj_f is not None:
             # Full trajectory: the multi-turn response string already contains the
             # interleaved <tool_call>/<tool_response>/<answer> turns verbatim.
             traj_f.write(json.dumps({
                 "id": row.get("id"), "data_source": ds, "question": row.get("question"),
                 "gold": gt.get("target"), "score": score,
-                "prompt": prompt_text, "response": response,
+                "answered": res["answered"], "forced": res["forced"], "n_turns": res["n_turns"],
+                "prompt": prompt_text, "response": res["response"],
             }, ensure_ascii=False) + "\n")
     if traj_f is not None:
         traj_f.close()
@@ -451,15 +619,24 @@ async def main():
         ds: {"n": len(s), "em": sum(s) / len(s)} for ds, s in sorted(per_ds_scores.items())
     }
     all_scores = [s for v in per_ds_scores.values() for s in v]
+    n = len(all_scores)
+    # answered-only EM: capability signal with the turn-budget floor removed.
+    answered_em = answered_score_sum / max(n_answered, 1)
     summary = {
         "benchmark": "Search-R1 EM (tool-call)",
         "data": args.data,
-        "n_samples": len(all_scores),
-        "em_overall": sum(all_scores) / max(len(all_scores), 1),
+        "n_samples": n,
+        "em_overall": sum(all_scores) / max(n, 1),
+        "answered_rate": n_answered / max(n, 1),
+        "answered_only_em": answered_em,
+        "forced_answer_rate": n_forced / max(n, 1),
         "per_dataset": per_dataset,
         "max_turns": args.max_turns,
         "topk": args.topk,
         "temperature": args.temperature,
+        "context_format": args.context_format,
+        "force_final_answer": args.force_final_answer,
+        "max_response_tokens": args.max_response_tokens,
         "elapsed_sec": round(time.time() - t0, 1),
     }
     with open(args.output, "w") as f:

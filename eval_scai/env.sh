@@ -60,6 +60,35 @@ MMLU_TEMPERATURE="${MMLU_TEMPERATURE:-0.7}"     # matches previous runs
 TAU2_LIMIT="${TAU2_LIMIT:-}"                    # e.g. 5 for smoke tests; empty = full
 TAU2_MESSAGE_LIMIT="${TAU2_MESSAGE_LIMIT:-50}"  # cap agent/user turns per sample
 TAU2_DOMAINS="${TAU2_DOMAINS:-retail airline telecom}"
+# tau2 uses its OWN temperature (not the shared INSPECT_TEMPERATURE) so it can be
+# aligned with tau1's eval temperature (0.7) without changing gpqa/aime/ifeval.
+TAU2_TEMPERATURE="${TAU2_TEMPERATURE:-0.7}"
+
+# --- tau-bench v1 (training-aligned, benchmarks/tau) -------------------------
+# Reuses generate_with_tau.generate — the SAME rollout function slime trains on —
+# so the number is apples-to-apples with the training rollout reward. Runs
+# ALONGSIDE the inspect tau2 eval above; tau1 only has retail/airline (no telecom).
+# Needs the slime/training env (tau_bench + slime importable), NOT the inspect venv.
+TAU1_PYBIN="${TAU1_PYBIN:-${PYBIN}}"                       # python with slime + tau_bench
+TAU1_EXAMPLE_DIR="${TAU1_EXAMPLE_DIR:-${SLIME_ROOT}/examples/tau-bench}"
+TAU1_DOMAINS="${TAU1_DOMAINS:-retail airline}"            # tau1 envs (no telecom)
+TAU1_SPLIT="${TAU1_SPLIT:-test}"                          # held-out split for eval
+TAU1_RUNS="${TAU1_RUNS:-3}"
+TAU1_LIMIT="${TAU1_LIMIT:-}"                              # cap #tasks for smoke tests
+TAU1_TEMPERATURE="${TAU1_TEMPERATURE:-0.7}"              # matches EVAL_ARGS eval-temperature
+TAU1_MAX_NEW_TOKENS="${TAU1_MAX_NEW_TOKENS:-2048}"       # matches EVAL_ARGS eval-max-response-len
+TAU1_CONCURRENCY="${TAU1_CONCURRENCY:-16}"
+# User simulator (distinct capable model — self-play loops echo otherwise).
+# Mirrors TAU_CONFIGS in generate_with_tau.py; reached via the OpenAI provider.
+TAU1_USER_MODEL="${TAU1_USER_MODEL:-zai-org/GLM-4.7-Flash}"
+TAU1_USER_PROVIDER="${TAU1_USER_PROVIDER:-openai}"
+TAU1_USER_BASE_URL="${TAU1_USER_BASE_URL:-http://127.0.0.1:8401/v1}"  # GLM user-sim server
+TAU1_USER_API_KEY="${TAU1_USER_API_KEY:-dummy}"
+TAU1_USER_HEALTH_URL="${TAU1_USER_HEALTH_URL:-}"          # optional /health to wait on
+# Optional per-env test-task jsonl (tau1_mock.py output, input-key 'index'); if
+# unset the driver enumerates all split tasks via tau_bench.
+TAU1_TASKS_RETAIL="${TAU1_TASKS_RETAIL:-}"
+TAU1_TASKS_AIRLINE="${TAU1_TASKS_AIRLINE:-}"
 
 # --- IFBench -----------------------------------------------------------------
 IFBENCH_DATA="${IFBENCH_DATA:-${SLIME_ROOT}/examples/ifbench/IFBench_eval.jsonl}"
@@ -93,11 +122,28 @@ SEARCH_CONCURRENCY="${SEARCH_CONCURRENCY:-64}"
 # eval_scai. We point at the original eval/ checkout so the corpus, BM25 index
 # and venv are reused. To go standalone, clone+index BCP under eval_scai and
 # override BCP_ROOT.
+#
+# Agent format: run_browsecomp.sh uses the official qwen_client.py (native
+# OpenAI function-calling). For checkpoints trained on the search-task tool-call
+# TEXT format (<tool_call>/<tool_response>/<answer>, e.g. willhx/*-Search), use
+# the drop-in agent instead — see run_browsecomp_toolcall.sh +
+# browsecomp_toolcall_client.py (official dataset/retriever/judge unchanged;
+# only the agent's parsing format differs).
+BCP_RETRIEVER_PORT="${BCP_RETRIEVER_PORT:-8601}"   # search_r1_server.py /retrieve (tool-call agent)
+BCP_MODEL_SERVER="${BCP_MODEL_SERVER:-http://127.0.0.1:${EVAL_PORT}}"  # sglang /generate root (no /v1)
+BCP_TOPK="${BCP_TOPK:-5}"
+BCP_MAX_TURNS="${BCP_MAX_TURNS:-10}"        # BCP needs deeper search than Search-R1
+BCP_CONCURRENCY="${BCP_CONCURRENCY:-16}"
 BCP_ROOT="${BCP_ROOT:-/xuanwu-tank/north/xw27/multi/eval/benchmarks/browsecomp_plus/BrowseComp-Plus}"
 BCP_VENV="${BCP_ROOT}/.venv"
 BCP_MCP_PORT="${BCP_MCP_PORT:-8600}"
 BCP_LIMIT="${BCP_LIMIT:-}"                  # empty = all 830 queries
-BCP_MAX_TOKENS="${BCP_MAX_TOKENS:-10000}"
+# PER-TURN generation cap. Was 10000, which let the agent monologue one whole
+# turn to the length cap without ever emitting </tool_call>/</answer> (→ 0 search,
+# unparseable answer). 2048 matches the training per-turn budget so the model
+# commits to an action; BCP_MAX_RESPONSE_TOKENS bounds the whole rollout.
+BCP_MAX_TOKENS="${BCP_MAX_TOKENS:-2048}"
+BCP_MAX_RESPONSE_TOKENS="${BCP_MAX_RESPONSE_TOKENS:-4096}"  # total across all turns (training: 4096)
 # Judge endpoint for evaluate_with_openai.py (defaults to the served model;
 # the official leaderboard judge is Qwen3-32B — point these at one if you
 # need leaderboard-comparable numbers).
