@@ -1,0 +1,28 @@
+# Auto-resume the tau2 eval (8 servers + 4-lane eval) after every spot stop/start.
+# Current-root anchored: repo + hf_cache + tau2_data all on /home/ec2-user.
+# Install once (lives on the persistent root volume):
+#   sudo cp /home/ec2-user/slime/aws/tau2eval.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable tau2eval          # arm for next boot
+# Test now without rebooting:  sudo systemctl start tau2eval
+# Watch:  docker exec tau2run tail -f /home/ec2-user/slime/eval_scai/logs/tau2_rp/MASTER_resume.log
+# Disable: sudo systemctl disable tau2eval
+[Unit]
+Description=tau2 eval auto-resume (model+GLM servers + 4-lane eval) after spot stop/start
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Environment=HOME=/root
+WorkingDirectory=/home/ec2-user/slime
+ExecStart=/home/ec2-user/slime/aws/autostart-tau2.sh
+# Long sglang loads (GLM ~30 min) happen synchronously inside the wait loop.
+KillMode=process
+TimeoutStartSec=3000
+
+[Install]
+WantedBy=multi-user.target
