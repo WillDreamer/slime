@@ -20,6 +20,12 @@ from slime.rollout.sglang_rollout import get_model_url
 # Set up logger for this module
 logger = logging.getLogger(__name__)
 
+# Placeholder token id for the degenerate-sample no-op (see res_to_sample). Any
+# in-vocab id works: the synthetic sample's loss_mask is ALL ZERO, so these
+# tokens never contribute a gradient — they exist only to give get_batch a
+# structurally valid (prompt_length >= 1) tensor instead of an empty one.
+_ABORT_PLACEHOLDER_TOKEN_ID = 0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tau-bench configuration (AECE / Greenland).
 #
@@ -104,6 +110,68 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
         Status.ABORTED: Sample.Status.ABORTED,
     }
     status = status_mapping.get(res.status, Sample.Status.ABORTED)
+
+    # ── Degenerate-sample guard (Option 1: drop from training) ──
+    # asolve's env-reset failure path early-returns an EMPTY result
+    # (prompt_token_ids=[], response_token_ids=[]), so res.tokens == [] and
+    # res.response_length == 0. That sample is ABORTED, but the tau custom
+    # generate path bypasses slime's standard ABORTED filtering, so it reaches
+    # the trainer. There, get_batch (megatron_utils/data.py) computes
+    #   prompt_length = total_length - response_length
+    # and does F.pad(loss_mask, (prompt_length - 1, 1)). With an empty sample
+    # prompt_length == 0 -> negative left-pad -> the job-killing
+    #   RuntimeError: narrow(): length must be non-negative
+    # (Greenland job 0b483c04, first train step.)
+    #
+    # We cannot physically drop the sample: generate_rollout_async asserts every
+    # group has exactly n_samples_per_prompt samples (GRPO needs the full group),
+    # so removing one breaks the group. Instead we emit a STRUCTURALLY VALID but
+    # ZERO-GRADIENT no-op: a 1-token prompt + 1-token response with loss_mask all
+    # zero. prompt_length == 1 keeps F.pad non-negative, and the all-zero
+    # loss_mask means this sample contributes nothing to the loss — equivalent to
+    # dropping it. If the whole task's group degenerates (env fully failed to
+    # reset for all n_samples), every sample carries the same reward, so the
+    # dynamic_sampling_filter (check_reward_nonzero_std) drops the entire group
+    # and the task is skipped — the desired outcome.
+    # Guard the EXACT crash condition: get_batch needs prompt_length >= 1, where
+    # prompt_length = total_length - response_length = len(res.tokens) - response_length
+    # (res.tokens = prompt_token_ids + response_token_ids; response_length =
+    # len(response_token_ids); so this == len(prompt_token_ids)). This single
+    # expression catches the empty early-return (tokens=[]) AND any pathological
+    # state where the prompt half is empty while the response half is not.
+    n_tokens = len(res.tokens) if res.tokens else 0
+    resp_len = res.response_length if (getattr(res, "response_length", None) is not None) else 0
+    prompt_length = n_tokens - resp_len
+    is_degenerate = (n_tokens == 0) or (resp_len <= 0) or (prompt_length <= 0)
+    if is_degenerate:
+        logger.warning(
+            f"res_to_sample: degenerate trajectory for task {task_index} "
+            f"(status={res.status}, tokens_len={n_tokens}, response_length={resp_len}, "
+            f"prompt_length={prompt_length}); emitting a zero-gradient no-op sample "
+            f"(loss_mask all 0) so it is excluded from training without breaking the "
+            f"GRPO group."
+        )
+        noop = Sample(
+            index=task_index,
+            prompt=res.prompt if res.prompt else str(task_index),
+            tokens=[_ABORT_PLACEHOLDER_TOKEN_ID, _ABORT_PLACEHOLDER_TOKEN_ID],
+            response="",
+            reward=0.0,
+            loss_mask=[0],
+            status=Sample.Status.ABORTED,
+            metadata=res.info,
+            rollout_log_probs=[0.0],
+            # Also flag it the slime-native way: rollout.py zeroes the loss_mask of
+            # any remove_sample=True sample (and the loss reducer clamps the
+            # per-sample token denominator with clamp_min(.,1), so an all-zero mask
+            # is div-by-zero safe). Belt-and-suspenders with our explicit [0] mask.
+            remove_sample=True,
+        )
+        # total_length=len(tokens)=2, response_length=1 -> prompt_length=1 in
+        # get_batch (data.py:139); len(loss_mask)==response_length==1 satisfies the
+        # rollout.py:753 assert.
+        noop.response_length = 1
+        return noop
 
     # Debug logging for response tracking
     logger.debug(

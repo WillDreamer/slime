@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
+import os
 import socket
 import time
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import timedelta
 
 import ray
 import torch
@@ -14,6 +17,22 @@ from ray.actor import ActorHandle
 from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
+
+logger = logging.getLogger(__name__)
+
+# Bound the actor<->rollout weight-update-group rendezvous so a cross-subnet
+# unreachable node set FAILS LOUD in minutes instead of hanging for hours.
+# This group is [train rank0 + all actor-engine GPUs] formed over a TCP store on
+# train rank0's EPHEMERAL port (see connect_rollout_engines_from_distributed).
+# When the disaggregated nodes span different /24 subnets, that ephemeral TCP
+# port may be unreachable cross-/24 (Greenland only guarantees AZ-level
+# topology), and the rendezvous spins forever. Crucially, TORCH_NCCL_TIMEOUT_MS /
+# TORCH_NCCL_BLOCKING_WAIT do NOT cover this: they govern NCCL COLLECTIVES, not
+# the pre-NCCL TCPStore rendezvous inside init_process_group. So we set an
+# explicit store/PG timeout here AND bound the ray.get on the engine-side joins.
+# Override via env (seconds); default 600s = 10 min. (See memory
+# slime-disagg-weightsync-crosssubnet-hang.)
+WEIGHT_UPDATE_GROUP_TIMEOUT_S = int(os.environ.get("SLIME_WEIGHT_UPDATE_GROUP_TIMEOUT_S", "600"))
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
@@ -312,14 +331,44 @@ def connect_rollout_engines_from_distributed(
         )
         for i, engine in enumerate(rollout_engines)
     ]
+    logger.info(
+        f"[{group_name}] forming weight-update group: world_size={world_size} "
+        f"(train rank0 @ {master_address}:{master_port} + {len(rollout_engines)} engines), "
+        f"timeout={WEIGHT_UPDATE_GROUP_TIMEOUT_S}s. If the rollout engines are on a "
+        f"different /24 subnet than {master_address}, the TCP rendezvous on the "
+        f"ephemeral port may be unreachable -> this will error (not hang)."
+    )
+    # Explicit timeout so the TCPStore rendezvous (pre-NCCL) fails loud instead of
+    # spinning forever on a cross-subnet-unreachable ephemeral port.
+    timeout = timedelta(seconds=WEIGHT_UPDATE_GROUP_TIMEOUT_S)
     model_update_groups = init_process_group(
         backend="nccl",
         init_method=f"tcp://{master_address}:{master_port}",
         world_size=world_size,
         rank=0,
         group_name=group_name,
+        timeout=timeout,
     )
-    ray.get(refs)
+    # Bound the wait on the engine-side joins too: ray.get blocks until every
+    # engine's init_weights_update_group returns, which itself blocks on the same
+    # rendezvous. Without a timeout a stuck engine wedges the whole job silently.
+    # ray.get(timeout=) raises ray.exceptions.GetTimeoutError on timeout. Resolve
+    # the class defensively so a Ray-version rename can't turn our intended
+    # timeout->error into an AttributeError that masks the real diagnosis.
+    _GetTimeoutError = getattr(ray.exceptions, "GetTimeoutError", TimeoutError)
+    try:
+        ray.get(refs, timeout=WEIGHT_UPDATE_GROUP_TIMEOUT_S)
+    except (_GetTimeoutError, TimeoutError) as e:
+        raise RuntimeError(
+            f"[{group_name}] weight-update-group rendezvous timed out after "
+            f"{WEIGHT_UPDATE_GROUP_TIMEOUT_S}s: not all {len(rollout_engines)} rollout "
+            f"engines joined the NCCL group anchored at {master_address}:{master_port}. "
+            f"Most likely the disaggregated train/rollout nodes span different /24 "
+            f"subnets and the ephemeral TCP rendezvous port is unreachable cross-subnet. "
+            f"Retry the job (often lands a better node set) or raise "
+            f"SLIME_WEIGHT_UPDATE_GROUP_TIMEOUT_S. See memory "
+            f"slime-disagg-weightsync-crosssubnet-hang."
+        ) from e
     return model_update_groups
 
 

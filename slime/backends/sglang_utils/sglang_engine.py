@@ -639,6 +639,29 @@ def _compute_server_args(
             else:
                 unused_keys.add(normalized_key)
 
+    # sglang-native data parallelism (dp_size > 1) requires nccl_port=None.
+    # Why: with dp_size>1, sglang's DataParallelController.launch_dp_schedulers
+    # loops over dp_rank and calls PortArgs.init_new(server_args) for EACH
+    # worker. init_new only picks a fresh free port when server_args.nccl_port
+    # is None — otherwise it returns the SAME pinned nccl_port for every worker.
+    # The controller binds rank 0's port and HOLDS the socket so "the next dp
+    # worker gets a different port", but that only works if init_new searches
+    # (nccl_port is None); with a pinned port rank 1 re-requests the identical
+    # port and dies with "OSError: Could not bind port <nccl_port>". slime
+    # always pins nccl_port (allocated per engine in rollout.py), which is fine
+    # for the dp_size==1 engines (actor) but fatal for a dp_size>1 engine like
+    # the tau user-sim (sglang-native DP=8). Null it ONLY for the DP>1 case so
+    # sglang self-allocates one free nccl port per replica; dp_size==1 keeps the
+    # pinned port (unchanged behavior). dp_size may be int or str (YAML override).
+    if int(kwargs.get("dp_size", 1) or 1) > 1:
+        if kwargs.get("nccl_port") is not None:
+            logger.info(
+                f"dp_size={kwargs.get('dp_size')} > 1: clearing pinned nccl_port="
+                f"{kwargs.get('nccl_port')} -> None so sglang's DP controller "
+                f"self-allocates a distinct free nccl port per replica (rank={rank})."
+            )
+        kwargs["nccl_port"] = None
+
     # for compatibility with old args
     if len(unused_keys) > 0:
         logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")

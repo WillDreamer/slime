@@ -671,7 +671,13 @@ class LocalUserSimulationEnv(BaseUserSimulationEnv):
             )
         self.model = model or os.environ.get("TAU_USER_MODEL_ID", "user_sim")
         self.max_tokens = int(os.environ.get("TAU_USER_MAX_TOKENS", "1000"))
-        self.temperature = float(os.environ.get("TAU_USER_TEMP", "0.0"))
+        # DEFAULT 0.7 (was 0.0). At temperature 0 the GLM user-sim decodes greedily,
+        # so once the dialogue state stabilizes it emits the SAME line every turn —
+        # observed as a verbatim-echo death loop (114/256 trajectories repeated one
+        # reply, up to 25x; 38% of consecutive user-sim turns byte-identical), which
+        # never advances the task and burns the 30-turn cap -> reward -0.2 on ~44%
+        # of trajectories. Sampling at 0.7 lets the user-sim break out of the loop.
+        self.temperature = float(os.environ.get("TAU_USER_TEMP", "0.7"))
         self.timeout = float(os.environ.get("TAU_USER_HTTP_TIMEOUT", "60"))
         # GLM-4.7-Flash is a HYBRID reasoning model (thinking ON by default). For a
         # user simulator we want a terse one-line user turn, NOT a chain of thought:
@@ -680,6 +686,11 @@ class LocalUserSimulationEnv(BaseUserSimulationEnv):
         # no-think via the OpenAI `chat_template_kwargs.enable_thinking=false`
         # (honored by SGLang's GLM chat template). Disable with TAU_USER_NO_THINK=0.
         self.no_think = os.environ.get("TAU_USER_NO_THINK", "1") not in ("0", "false", "False")
+        # HOW to request no-think (the chat_template_kwargs KEY). GLM-4.7 may 400
+        # on the Qwen-style "enable_thinking" key, so default to "off" (send no
+        # kwarg; reasoning_parser glm45 keeps any CoT out of `content` anyway).
+        # Override: TAU_USER_THINK_KWARG=enable_thinking|thinking|off.
+        self._think_kwarg_mode = os.environ.get("TAU_USER_THINK_KWARG", "off").strip()
         self.total_cost = 0.0  # local model has no $ cost; kept for API parity
         self.reset()
 
@@ -703,11 +714,20 @@ class LocalUserSimulationEnv(BaseUserSimulationEnv):
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
-        if self.no_think:
+        if self.no_think and self._think_kwarg_mode != "off":
             # SGLang passes chat_template_kwargs through to the model's chat
-            # template; GLM honors enable_thinking=false there. Harmless for
-            # servers/models that don't recognize it (ignored key).
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            # template. NOTE: `enable_thinking` is the QWEN convention; GLM-4.7's
+            # template may NOT accept it and can 400 the whole request (suspected
+            # root cause of a 26.5k-deterministic-400 run against the GLM user-sim).
+            # So the KEY is configurable via TAU_USER_THINK_KWARG:
+            #   off              -> send nothing (let GLM default; reasoning is
+            #                       split into reasoning_content by reasoning_parser
+            #                       glm45, so it won't pollute the user message)
+            #   enable_thinking  -> {"enable_thinking": False}   (Qwen-style)
+            #   thinking         -> {"thinking": False}          (some GLM builds)
+            # Default below stays enable_thinking for backward-compat, but the run
+            # script defaults the ENV to "off" (GLM-safe). One key only.
+            payload["chat_template_kwargs"] = {self._think_kwarg_mode: False}
         session = _get_http_session()
 
         max_retries = int(os.environ.get("TAU_USER_MAX_RETRIES", "8"))
@@ -717,6 +737,22 @@ class LocalUserSimulationEnv(BaseUserSimulationEnv):
         for attempt in range(1, max_retries + 1):
             try:
                 resp = session.post(self.base_url, json=payload, timeout=self.timeout)
+                # A 4xx (except 429 Too-Many-Requests) is a DETERMINISTIC reject:
+                # the request is malformed/unacceptable, so retrying it 8x is pure
+                # waste and floods the logs (observed: 26.5k identical 400s, every
+                # call burning all 8 attempts then aborting the whole trajectory).
+                # Surface the server's response BODY (the real reason — SGLang does
+                # not log it in CloudWatch) and fail fast instead of retrying.
+                if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    body = ""
+                    try:
+                        body = resp.text[:500]
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"local user-sim {resp.status_code} (non-retryable client error) "
+                        f"from {self.base_url}; body={body!r}"
+                    )
                 resp.raise_for_status()
                 data = resp.json()
                 text = data["choices"][0]["message"]["content"] or ""
@@ -724,6 +760,13 @@ class LocalUserSimulationEnv(BaseUserSimulationEnv):
                     return text
                 # Empty completion — treat as transient and retry.
                 last_err = RuntimeError("empty completion from local user-sim")
+            except RuntimeError as e:
+                # Non-retryable client error raised above — re-raise immediately so
+                # asolve aborts this trajectory without burning the retry budget.
+                if "non-retryable client error" in str(e):
+                    logger.warning(f"Local user-sim NON-RETRYABLE: {e}")
+                    raise
+                last_err = e
             except Exception as e:  # noqa: BLE001 — retry on ANY transient failure
                 last_err = e
 

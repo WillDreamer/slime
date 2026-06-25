@@ -9,14 +9,18 @@ from enum import Enum
 from typing import Any
 
 from openai_tool_adapter import create_openai_adapter
-from tau_bench.agents.base import Agent
-from tau_bench.agents.tool_calling_agent import RESPOND_ACTION_NAME, ToolCallingAgent
-from tau_bench.types import Action, RunConfig
+from ws_bench.agents.base import Agent
+from ws_bench.agents.tool_calling_agent import ToolCallingAgent
+from ws_bench.types import Action, RESPOND_ACTION_NAME, RunConfig
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
+
+# The terminate tool whose step triggers the rubric judge (reward). Used for
+# rollout time-attribution (which env.step blocked on the Bedrock judge call).
+FINISH_TOOL_NAME = "finish"
 
 # SGLang function-call parser to use when extracting <tool_call> blocks from the
 # model's raw text. This MUST match the model's chat-template tool-call format:
@@ -27,36 +31,33 @@ logger = logging.getLogger(__name__)
 #       -> "qwen3_coder"
 # Mismatch silently yields zero parsed tool calls (every turn becomes a RESPOND),
 # which collapses training. Default to qwen3_coder for the Qwen3.5 migration;
-# override with TAU_TOOL_PARSER if you swap base models.
-TOOL_PARSER_TYPE = os.environ.get("TAU_TOOL_PARSER", "qwen3_coder")
+# override with WS_TOOL_PARSER if you swap base models.
+TOOL_PARSER_TYPE = os.environ.get("WS_TOOL_PARSER", "qwen3_coder")
 
 
 # Format-check regexes for the per-turn shape we want every assistant turn to take:
 #   (A) tool-call turn:  [<think>...</think>]{optional preamble}<tool_call>...</tool_call>
 #   (B) respond turn:    [<think>...</think>]{plain natural-language reply}
-# The `<think>...</think>` prefix is OPTIONAL: this model (TauSFT init) is a
-# no-think tool-calling agent, and Qwen3's chat template strips `<think>` from
-# every historical assistant turn before the last user query anyway, so the
+# The `<think>...</think>` prefix is OPTIONAL: this model (Qwen3.5-4B-Base init)
+# is a no-think tool-calling agent, and Qwen3's chat template strips `<think>`
+# from every historical assistant turn before the last user query anyway, so the
 # canonical per-turn shape carries no visible CoT. Requiring `<think>` made
 # format_ok==0 on 100% of turns, turning FORMAT_BAD_PENALTY into a flat tax on
-# winners (zero signal).
+# winners (zero signal). (See the tau-bench migration notes — this regex was
+# tuned on tens of thousands of real assistant turns; it is benchmark-agnostic.)
 #
 # IMPORTANT — natural-language PREAMBLE before <tool_call> is ALLOWED (the fix
 # that mattered): the model's dominant correct shape is a short sentence ("Let me
-# look up your order.") FOLLOWED by the call. The old _FORMAT_TOOLCALL_RE pinned
+# read the config file.") FOLLOWED by the call. The old _FORMAT_TOOLCALL_RE pinned
 # <tool_call> to the very start (after optional <think>), so every "preamble +
 # call" turn fell through to the respond branch, hit <tool_call> in the tail, and
-# was scored format-bad. Measured on 52,482 real assistant turns from
-# s3://whx-agent/AECE/tau_rl/tau_rl_Qwen35-4B_nothink_bs_32: 33% of ALL turns are
-# this "preamble + one call" shape, and they were ALL mis-flagged — so format_ok
-# sat at ~0.00-0.15 (NOT the ~96% an earlier comment claimed) and corr(num_tool_calls,
-# format_ok) went NEGATIVE: a reward term that PENALIZED correct tool use. Allowing
-# the preamble flips trajectory format_ok to ~0.58-0.81 with zero new false-OKs.
+# was scored format-bad. Allowing the preamble flips trajectory format_ok up with
+# zero new false-OKs.
 #
 # We still reject genuine structural garbage: more than one <tool_call>, an
 # orphan/unclosed </tool_call>, text AFTER </tool_call> (the rollout STOPs on
-# </tool_call>, so a real tool turn ends exactly there — observed in 0/52482
-# turns), leftover <tool_response>/<|im_*|> markup, or a malformed/double <think>.
+# </tool_call>, so a real tool turn ends exactly there), leftover
+# <tool_response>/<|im_*|> markup, or a malformed/double <think>.
 # A tool turn's PREAMBLE is also scanned for that markup (only the user-visible
 # reply text before the call may be free-form). Bad turns pay an additive
 # FORMAT_BAD_PENALTY on task reward.
@@ -69,13 +70,7 @@ TOOL_PARSER_TYPE = os.environ.get("TAU_TOOL_PARSER", "qwen3_coder")
 #   * no-think / closed:   <think>...</think>   (opening tag present)
 #   * think-ON / ORPHAN:   ...</think>          (NO opening tag — Qwen3.5 puts the
 #         opening <think> in the generation PROMPT, so the model's sampled turn
-#         starts with raw reasoning and only emits the CLOSING </think>. Confirmed
-#         from the real think-ON trajectory rollout_1.pt: per-turn content has
-#         <think>=0, </think>=1. With the OLD regex (which REQUIRED the opening
-#         tag) EVERY think-ON turn was judged format-bad — format_ok=0 on all
-#         256 samples / 1435 turns — which drove the reward-collapse + empty-batch
-#         crash (job 221858c8). The NEW regex below scores 0.997 format_ok on the
-#         same 1435 real turns while still rejecting genuine garbage.)
+#         starts with raw reasoning and only emits the CLOSING </think>.)
 # `_THINK_PREFIX` optionally consumes one think block: an OPTIONAL opening
 # `<think>`, then a reasoning body that contains NO further `<think>`/`</think>`
 # (tempered dot `(?:(?!</?think>).)*` — forbids nesting / a second block), then
@@ -97,12 +92,8 @@ _FORMAT_MARKUP_GARBAGE = (
     "<|im_start|>", "<|im_end|>", "<think>", "</think>",
 )
 # Additive penalties subtracted from total_reward when any assistant turn is
-# format-bad. With the <think> requirement dropped AND the preamble-before-call
-# shape allowed (see regex block), trajectory format_ok now passes on ~0.6-0.8 of
-# rollouts (measured on the nothink run), so this fires on genuine structural
-# garbage instead of on every correct tool turn — a real signal again, not an
-# inverted tax that punished tool use. Weakened so format noise can't dominate
-# the task signal:
+# format-bad. Fires on genuine structural garbage instead of on every correct tool
+# turn. Weakened so format noise can't dominate the task signal:
 #   - Successful (raw>0): pay 0.1 — light tap, still leaves +0.9 reward.
 #   - Failed (raw==0): no penalty. We rely on the task gradient (and SFT) for
 #     format learning; double-charging failures was hurting more than helping.
@@ -111,9 +102,8 @@ FORMAT_BAD_PENALTY_FAIL = 0.0
 
 # Think length penalty is DISABLED. Earlier ablation showed it created a
 # perverse gradient ("failed + long think" got -0.3, worse than truncation),
-# pulling the model away from the SFT init's long-CoT distribution and
-# collapsing tau-bench planning quality. We still measure avg_think_chars
-# below for wandb monitoring, but the penalty term is forced to 0.
+# pulling the model away from the SFT init's long-CoT distribution. We still
+# measure avg_think_chars below for wandb monitoring, but the penalty is forced 0.
 THINK_BUDGET_PER_TURN_CHARS = 500
 THINK_PENALTY_PER_OVERAGE_CHAR = 0.0
 THINK_PENALTY_CAP = 0.0
@@ -122,18 +112,16 @@ _THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 def _strip_think_for_user(text: str) -> str:
     """Strip the reasoning (everything up to and including the LAST </think>) from
-    a RESPOND turn's text BEFORE it is handed to the user simulator.
+    a RESPOND turn's text BEFORE it is handed to the environment.
 
     WHY (think-ON only): with enable_thinking, the model's output is
     `reasoning...</think>\\n\\nvisible reply` (the opening <think> lives in the
     prompt, so the sampled text is an ORPHAN-close block). The tool parser's
-    `normal_text` does NOT remove this — only tool-call markup. Without stripping,
-    the user simulator received the agent's INTERNAL MONOLOGUE ("The user is asking
-    me to authenticate...", "I should use the tools...") as the agent's message,
-    and GLM then echoed/agreed with that agent-voice text instead of role-playing
-    the customer (measured: agent-voice user-sim replies 5% no-think → 30% think-ON,
-    feeding 30-turn echo loops). no-think turns have no </think> so this is a no-op.
-    Note: we only strip the copy SENT to the user-sim; the trained `cur_response`
+    `normal_text` does NOT remove this — only tool-call markup. Workspace-Bench has
+    no user simulator, but we still strip so any text the env echoes back / logs is
+    the agent's visible reply, not its internal monologue. no-think turns have no
+    </think> so this is a no-op.
+    Note: we only strip the copy SENT to the env; the trained `cur_response`
     (loss-mask source) is left untouched."""
     if "</think>" not in text:
         return text
@@ -218,23 +206,25 @@ def call_to_action_sglang(calls: list[Any], text_response: str) -> Action:
 TOOL_INSTRUCTION = (
     " At each turn, you are allowed to call one or no function to assist "
     "with task execution using <tools></tools> XML tags.\n"
-    "YOU MUST EXECUTE TOOLS TO MAKE ANY MODIFICATIONS OR CANCELLATIONS. "
-    "Each tool call leads to a message returned by the system.\n"
-    "NEVER confirm execution to the user without seeing confirmation "
-    "from the tool system.\n"
+    "YOU MUST EXECUTE TOOLS (write_file / edit_file) TO MAKE ANY CHANGE TO THE "
+    "WORKSPACE — describing a change in text is NOT enough.\n"
+    "Explore with read_file / list_dir / grep before editing. Each tool call "
+    "leads to a message returned by the system.\n"
+    "When the task is fully complete and all required output files exist, call "
+    "the `finish` function.\n"
 )
 
 # Appended to TOOL_INSTRUCTION ONLY when enable_thinking is on (think-ON). The
 # Qwen3.5 template opens a `<think>` in the generation prompt, but NOTHING in the
 # system prompt tells the model the reasoning contract — so it free-runs (long,
-# unbounded CoT) and can confuse the `<think>` REASONING TAG with the tau `think`
+# unbounded CoT) and can confuse the `<think>` REASONING TAG with the `think`
 # TOOL (a real function called via <tool_call><function=think>). This clause
 # defines the contract and disambiguates the two. Kept short to bound CoT length.
 THINK_INSTRUCTION = (
     "\nReasoning format: BEGIN every turn by opening a <think> block, write your "
     "private step-by-step reasoning, then close it with </think>. After "
     "</think>, output EITHER a single <tool_call>...</tool_call> OR a plain-text "
-    "reply to the user — never both. Keep the reasoning concise.\n"
+    "reply — never both. Keep the reasoning concise.\n"
     "Note: the <think>...</think> reasoning tag is NOT the `think` function. To "
     "record a durable thought as a tool, call <tool_call><function=think>...; to "
     "merely reason before acting, just use the <think> block.\n"
@@ -243,38 +233,33 @@ THINK_INSTRUCTION = (
 
 class TrainableAgentMixin:
     """
-    Mixin class that provides trainable agent functionality for tau-bench environments.
+    Mixin class that provides trainable agent functionality for Workspace-Bench.
 
-    This mixin extends the original tau-bench agent with async LLM interaction
+    This mixin extends the tool-calling agent with async LLM interaction
     capabilities for reinforcement learning training using sglang servers.
     """
 
     def _reformulate_tool_call(self, text: str) -> str:
         """
-        Inject the tau-bench tool-use guidance into the rendered chat-template
-        prompt (one-or-no call per turn / MUST execute tools / NEVER pre-confirm).
+        Inject the file-agent tool-use guidance into the rendered chat-template
+        prompt (one-or-no call per turn / MUST execute tools to edit / call finish).
 
         IMPORTANT — template-format dependent:
           * Qwen3 / Hermes templates carry the sentence
                 "You may call one or more functions to assist with the user query."
-            which we replace outright (tau allows at most ONE call per turn).
+            which we replace outright (we allow at most ONE call per turn).
           * Qwen3.5-4B-Base / Qwen3-Coder use the XML tool format and DO NOT
             contain that sentence at all — its tools block reads
                 "If you choose to call a function ONLY reply in the following
                  format with NO suffix: <tool_call><function=...>..."
-            so the old `.replace(...)` was a NO-OP there and the tau guidance was
-            silently dropped from every prompt. For that template we insert
-            TOOL_INSTRUCTION just before the format spec instead.
+            so a naive `.replace(...)` would be a NO-OP there and the guidance
+            would be silently dropped. For that template we insert TOOL_INSTRUCTION
+            just before the format spec instead.
 
         Applied identically at sampling and training render time (both go through
         _render_messages_text), so the prompt prefix stays byte-consistent and
         the assistant-boundary alignment in _build_training_tensor is unaffected.
         """
-        # Compose the guidance once. The think clause is appended ONLY in think-ON
-        # mode (env TAU_ENABLE_THINKING=1). self._enable_thinking is cached and
-        # identical at sampling (ag=True) and training (ag=False) render, so the
-        # injected string is byte-consistent across both — _build_training_tensor's
-        # prefix alignment is unaffected.
         instruction = TOOL_INSTRUCTION
         if self._enable_thinking:
             instruction = instruction.rstrip("\n") + "\n" + THINK_INSTRUCTION
@@ -301,7 +286,7 @@ class TrainableAgentMixin:
         # guidance is absent, so this is a soft degradation, not a hard failure.
         if not getattr(self, "_warned_no_tool_anchor", False):
             logger.warning(
-                "tau-bench TOOL_INSTRUCTION anchor not found in chat template; "
+                "Workspace-Bench TOOL_INSTRUCTION anchor not found in chat template; "
                 "guidance not injected (tool-call format itself is unaffected). "
                 "Check the model's chat_template if reward looks degraded."
             )
@@ -342,7 +327,7 @@ class TrainableAgentMixin:
         Execute a tool/action in the environment.
 
         Args:
-            env: Tau-bench environment instance
+            env: Workspace-Bench environment instance
             action: Action to execute
 
         Returns:
@@ -355,7 +340,7 @@ class TrainableAgentMixin:
         Initialize the environment and get initial observation.
 
         Args:
-            env: Tau-bench environment instance
+            env: Workspace-Bench environment instance
             task_index: Task index to reset to
 
         Returns:
@@ -383,19 +368,16 @@ class TrainableAgentMixin:
     def _enable_thinking(self) -> bool:
         """Hyperparameter: whether the chat template runs in thinking mode.
 
-        Read from env TAU_ENABLE_THINKING (default True = think-ON; set 0 for the
+        Read from env WS_ENABLE_THINKING (default True = think-ON; set 0 for the
         no-think path). The earlier think-ON crash was the FORMAT regex requiring
         an opening <think> tag (fixed in _THINK_PREFIX), not token alignment.
         Set by the run script from a CLI/env knob so it is consistent across all
         rollout actors (the value is injected into the Ray job runtime-env, like
-        the other TAU_* vars). Cached on first access.
+        the other WS_* vars). Cached on first access.
         """
         cached = getattr(self, "_enable_thinking_cached", None)
         if cached is None:
-            # Default "1" (think-ON) to match the run scripts' TAU_ENABLE_THINKING
-            # default. (The think-ON crash was the FORMAT regex requiring an opening
-            # <think>; fixed in _THINK_PREFIX. Set TAU_ENABLE_THINKING=0 for no-think.)
-            cached = os.environ.get("TAU_ENABLE_THINKING", "1").lower() in ("1", "true", "yes")
+            cached = os.environ.get("WS_ENABLE_THINKING", "1").lower() in ("1", "true", "yes")
             self._enable_thinking_cached = cached
         return cached
 
@@ -406,35 +388,29 @@ class TrainableAgentMixin:
 
         WHY (the bug this fixes): the Qwen3.5 chat template only strips a historical
         assistant turn's `<think>` once a LATER real `user` turn advances
-        `last_query_index`. But in tau the dominant trajectory shape is a single
-        user request followed by a long `tool` chain, and `tool` results render as
+        `last_query_index`. But the dominant trajectory shape is a single user
+        request followed by a long `tool` chain, and `tool` results render as
         `<|im_start|>user\\n<tool_response>...` which the template EXPLICITLY skips
-        when advancing `last_query_index` (the `not(content.startswith('<tool_response>')
-        ...)` guard). So `last_query_index` never moves, NO historical `<think>` is
-        ever stripped, and every turn's full CoT is carried in the trained tokens
-        AND re-fed as context on every subsequent turn — context grows linearly in
-        the number of tool calls, contradicting the asolve docstring's claim that
-        the template "drops <think> from every earlier assistant turn".
+        when advancing `last_query_index`. So `last_query_index` never moves, NO
+        historical `<think>` is ever stripped, and every turn's full CoT is carried
+        in the trained tokens AND re-fed as context on every subsequent turn —
+        context grows linearly in the number of tool calls.
 
         With this ON (default in think-ON mode) we pre-strip the reasoning from all
         but the last assistant turn ourselves BEFORE apply_chat_template, on BOTH
-        the sampling render (ag=True: every turn already-in-history is stripped) and
-        the training render (ag=False: all but the final assistant turn). The
+        the sampling render (ag=True) and the training render (ag=False). The
         template then re-injects an empty `<think>\\n\\n</think>\\n\\n` wrapper for
-        the stripped turns (its non-reasoning assistant arm), which
-        `_render_messages_text` collapses away. Net effect: only the turn being
-        generated carries visible CoT; historical turns are content-only — matching
-        what the asolve docstring always assumed and bounding context growth.
+        the stripped turns, which `_render_messages_text` collapses away.
 
-        Read once from env TAU_STRIP_HISTORICAL_THINK (default "1"). Set to 0 to
+        Read once from env WS_STRIP_HISTORICAL_THINK (default "1"). Set to 0 to
         keep the legacy behavior (full CoT in every historical turn). No-op when
-        think is OFF (no `<think>` to strip). Cached on first access.
+        think is OFF. Cached on first access.
         """
         cached = getattr(self, "_strip_hist_think_cached", None)
         if cached is None:
             cached = (
                 self._enable_thinking
-                and os.environ.get("TAU_STRIP_HISTORICAL_THINK", "1").lower() in ("1", "true", "yes")
+                and os.environ.get("WS_STRIP_HISTORICAL_THINK", "1").lower() in ("1", "true", "yes")
             )
             self._strip_hist_think_cached = cached
         return cached
@@ -455,7 +431,7 @@ class TrainableAgentMixin:
         messages: list[dict[str, Any]],
         add_generation_prompt: bool,
     ) -> str:
-        """Render messages via apply_chat_template + tau-bench tool-instruction patch.
+        """Render messages via apply_chat_template + tool-instruction patch.
 
         enable_thinking=False is CRITICAL for Qwen3.5 (and any Qwen "thinking"
         model). Its chat template, with add_generation_prompt=True and thinking
@@ -464,39 +440,34 @@ class TrainableAgentMixin:
         `reasoning…</think>…` (an ORPHAN close), and _build_training_tensor's
         think-preserved / think-stripped alignment matches neither -> ~2/3 of
         response tokens get loss_mask=0 and format_ok==0 on every turn, which
-        distorted the gradient and made raw_reward DROP over training (observed
-        on tau_rl_Qwen35-4B: 74.6%->58.2% while response_len grew). With
-        enable_thinking=False the template instead emits a CLOSED `<think>\\n\\n
-        </think>\\n\\n` and the agent runs no-think (matching the original
-        tau-bench design: a no-think tool-calling agent). Passed on BOTH the
-        sampling render (add_generation_prompt=True) and the training render
-        (add_generation_prompt=False) since both go through here, keeping the
-        per-token prefix byte-consistent.
+        distorts the gradient. With enable_thinking=False the template instead
+        emits a CLOSED `<think>\\n\\n</think>\\n\\n` and the agent runs no-think.
+        Passed on BOTH the sampling render (add_generation_prompt=True) and the
+        training render (add_generation_prompt=False) since both go through here,
+        keeping the per-token prefix byte-consistent.
 
         Some HF tokenizers don't accept enable_thinking; pass it via a try/except
         so this stays safe on non-Qwen templates.
         """
-        # enable_thinking is a HYPERPARAMETER (env TAU_ENABLE_THINKING, default
-        # False = the validated no-think path). When False the template emits a
-        # CLOSED empty `<think>\n\n</think>\n\n` and the agent runs no-think.
-        # When True the template emits a LONE opening `<think>\n` into the
-        # generation prompt and the model samples `reasoning…</think>…`; the
-        # sampled-vs-render token streams then differ per turn (see the case-(b)
-        # alignment in _build_training_tensor). This historically left ~2/3 of
-        # response tokens untrained — so when think is ON, _build_training_tensor
-        # surfaces a per-trajectory align-coverage metric to wandb so a broken
-        # alignment shows up in the FIRST few steps, not hours later via reward.
-        # MUST be read identically at sampling (ag=True) and training (ag=False)
-        # render so the per-token prefix stays byte-consistent.
+        # enable_thinking is a HYPERPARAMETER (env WS_ENABLE_THINKING). When False
+        # the template emits a CLOSED empty `<think>\n\n</think>\n\n` and the agent
+        # runs no-think. When True the template emits a LONE opening `<think>\n`
+        # into the generation prompt and the model samples `reasoning…</think>…`;
+        # the sampled-vs-render token streams then differ per turn (see the case-(b)
+        # alignment in _build_training_tensor). When think is ON,
+        # _build_training_tensor surfaces a per-trajectory align-coverage metric to
+        # wandb so a broken alignment shows up in the FIRST few steps. MUST be read
+        # identically at sampling (ag=True) and training (ag=False) render so the
+        # per-token prefix stays byte-consistent.
         # HISTORICAL-THINK STRIP (default in think-ON mode; see
         # _strip_historical_think). Pre-strip the `<think>...</think>` reasoning
         # from every assistant turn EXCEPT the one being generated/trained, so the
         # rendered context carries CoT only on the current turn. We must do this
         # ourselves because the template only strips a historical turn's think once
-        # a LATER real `user` turn advances last_query_index — and tau's
-        # tool-response turns (rendered as <tool_response> "user" turns) are
-        # explicitly skipped by that logic, so in a pure tool chain NO historical
-        # think is ever dropped by the template alone.
+        # a LATER real `user` turn advances last_query_index — and tool-response
+        # turns (rendered as <tool_response> "user" turns) are explicitly skipped
+        # by that logic, so in a pure tool chain NO historical think is ever dropped
+        # by the template alone.
         #   * Sampling render (ag=True): NONE of `messages` is the current turn yet
         #     (the current turn is what we're about to sample, appended only after),
         #     so strip every assistant turn. The prompt then ends at
@@ -549,27 +520,21 @@ class TrainableAgentMixin:
 
         # THINK-SELF-OPEN (default in think-ON mode). Qwen3.5's template, with
         # add_generation_prompt=True and thinking ON, appends a LONE opening
-        # `<think>\n` to the generation prompt (verified against the real HF
-        # chat_template: the `{%- else %}{{- '<think>\n' }}` arm of the
-        # add_generation_prompt block). That made the OPENING tag live in the
-        # PROMPT, so the model only ever sampled an ORPHAN `reasoning…</think>…`
+        # `<think>\n` to the generation prompt. That made the OPENING tag live in
+        # the PROMPT, so the model only ever sampled an ORPHAN `reasoning…</think>…`
         # — which _build_training_tensor had to re-align via case (b'), and which
         # was the root cause of the reward decline (the sampled stream never
         # carried the `<think>` token, alignment drifted, ~2/3 of tokens went
-        # untrained; see memory tau-reward-decline-rootcause / slime-think-token-
-        # loss-mask). We strip that injected `<think>\n` ONLY on the SAMPLING
+        # untrained). We strip that injected `<think>\n` ONLY on the SAMPLING
         # render (add_generation_prompt=True) so the prompt ends at
         # `<|im_start|>assistant\n` and the model samples its OWN complete
-        # `<think>\n…\n</think>\n\n…` block. The opening tag is now a trained
-        # token, and the last assistant turn's canonical render (ag=False, which
-        # re-wraps `<think>\n`+reasoning+`\n</think>\n\n`+content) matches the
+        # `<think>\n…\n</think>\n\n…` block. The opening tag is now a trained token,
+        # and the last assistant turn's canonical render (ag=False) matches the
         # sample exactly -> _build_training_tensor case (a), not the lossy (b').
         #   * Gated on self._enable_thinking: in no-think mode the suffix is the
-        #     CLOSED `<think>\n\n</think>\n\n` block, which we must NOT strip (it
-        #     is the validated no-think contract).
+        #     CLOSED `<think>\n\n</think>\n\n` block, which we must NOT strip.
         #   * Gated on add_generation_prompt: the training render (ag=False) has
-        #     no generation prompt / no trailing `<think>`, so it is untouched —
-        #     the per-token prefix the model saw at sampling still matches.
+        #     no generation prompt / no trailing `<think>`, so it is untouched.
         #   * The endswith() guard makes this a safe no-op on any template that
         #     does not inject a lone opening `<think>\n`.
         if add_generation_prompt and self._enable_thinking and text.endswith("<think>\n"):
@@ -615,8 +580,8 @@ class TrainableAgentMixin:
              strips historical <think> from all but the LAST assistant turn (see
              _strip_historical_think), so only the final turn carries CoT; earlier
              turns render content-only. (We drive this ourselves because the
-             template's last_query_index logic does NOT strip across tau's
-             tool-response turns.)
+             template's last_query_index logic does NOT strip across tool-response
+             turns.)
           2. Locate every `<|im_start|>assistant\\n` boundary in the rendered tokens
              and pair the i-th boundary with turn_samples[i].
           3. For each pair, the rendered span is one of:
@@ -814,16 +779,15 @@ class TrainableAgentMixin:
         wrap). In think-ON mode we also strip historical `<think>` ourselves (see
         `_render_messages_text` / `_strip_historical_think`): the template's own
         last_query_index logic only drops a turn's think once a LATER real user
-        turn arrives, but tau's tool-response turns do NOT advance last_query_index,
-        so a pure tool chain would otherwise carry every turn's full CoT forever.
-        The training tensor is rebuilt at end-of-trajectory from the same final
-        render, with per-turn sampled logprobs aligned back onto the surviving
-        tokens — see `_build_training_tensor` for the alignment cases.
+        turn arrives, but tool-response turns do NOT advance last_query_index, so a
+        pure tool chain would otherwise carry every turn's full CoT forever. The
+        training tensor is rebuilt at end-of-trajectory from the same final render,
+        with per-turn sampled logprobs aligned back onto the surviving tokens —
+        see `_build_training_tensor` for the alignment cases.
 
-        Trade-off vs. the prior string-concat path: a per-turn re-render costs
-        one tokenizer pass on a bounded message list, but in exchange the
-        rollout context exactly matches the SFT distribution and stops growing
-        the trajectory's <think> footprint after every RESPOND turn.
+        The episode ends when the agent calls the `finish` terminate tool (the env
+        sets done=True and computes the rubric-judge reward), or when it hits
+        max_num_steps / a length-truncation.
         """
         state = GenerateState(rollout_args)
         url = f"http://{rollout_args.sglang_router_ip}:" f"{rollout_args.sglang_router_port}/generate"
@@ -831,10 +795,10 @@ class TrainableAgentMixin:
         # Session-affinity routing for this multi-turn trajectory. When the router
         # policy is consistent_hashing, every turn of THIS trajectory must carry
         # the SAME routing key so the router hashes them all to one worker, which
-        # then reuses its prefix cache across turns (the bulk of a tau trajectory's
+        # then reuses its prefix cache across turns (the bulk of a trajectory's
         # prompt is the unchanged conversation history). The key is generated ONCE
         # here — not per turn — so it is stable for the whole `for` loop below.
-        # tau drives the actor via this custom path (not slime's sglang_rollout),
+        # We drive the actor via this custom path (not slime's sglang_rollout),
         # so the X-SMG-Routing-Key header that slime normally sets must be set here
         # too; gate it on the same `router_policy == "consistent_hashing"` so any
         # other policy (e.g. the default cache_aware) is unchanged (headers=None).
@@ -853,9 +817,8 @@ class TrainableAgentMixin:
         # turn. Qwen3-Base's generation_config sets eos=<|endoftext|> (151643),
         # so sglang by default does NOT stop on <|im_end|> (151645). Without
         # an explicit stop on <|im_end|>, a RESPOND-style reply (natural-
-        # language message to the user, no <tool_call>) burns through
-        # max_new_tokens after emitting its own <|im_end|> — the model keeps
-        # hallucinating a second <think> block past turn end.
+        # language message, no <tool_call>) burns through max_new_tokens after
+        # emitting its own <|im_end|>.
         stop_list = list(sampling_params.get("stop") or [])
         if "</tool_call>" not in stop_list:
             stop_list = stop_list + ["</tool_call>"]
@@ -871,36 +834,29 @@ class TrainableAgentMixin:
 
         # ── Rollout time-attribution (async overlap diagnostic) ──
         # Within a single trajectory the wall-clock between env.reset and the
-        # terminal turn splits across three buckets we want to separate on wandb:
-        #   t_actor    — waiting on the actor's own SGLang generation (_call_llm).
-        #   t_user_sim — waiting on env.reset()/env.step() when the step triggers
-        #                the user-simulator LLM call (the first user turn at reset
-        #                and every RESPOND action). This is the "waiting for the
-        #                user to reply" cost the operator asked to quantify.
-        #   t_tool     — env.step() for a tool action (local pure-python invoke);
-        #                cheap, but measured so it doesn't get charged to user_sim.
-        # NOTE: env.step does BOTH the user-sim call (on RESPOND) and the local
-        # tool invoke (on a tool action), and the terminal step also replays gt
-        # actions for reward. We attribute each step to user_sim vs tool by the
-        # action type that produced it, which is the dominant cost in each case.
-        # Times use a monotonic clock; they measure awaited wall-time per call,
-        # which under asyncio.gather overlaps across trajectories — so these are
-        # PER-TRAJECTORY sums, not a partition of the batch's wall-clock. The
-        # ratio t_user_sim/(t_actor+t_user_sim+t_tool) is the quantity of
-        # interest: what fraction of a trajectory's blocking time is spent
-        # waiting on the user simulator vs. the agent's own generation.
+        # terminal turn splits across three buckets we separate on wandb:
+        #   t_actor — waiting on the actor's own SGLang generation (_call_llm).
+        #   t_judge — waiting on env.step() for the terminal `finish` action, which
+        #             runs the BLOCKING Bedrock rubric judge (the reward). This is
+        #             the "waiting for the reward model" cost.
+        #   t_env   — env.reset() (workspace materialization) + every non-terminal
+        #             env.step() (local file-tool invoke). Cheap disk I/O, measured
+        #             so it isn't charged to the judge bucket.
+        # Times use a monotonic clock; under asyncio.gather they overlap across
+        # trajectories — so these are PER-TRAJECTORY sums, not a partition of the
+        # batch wall-clock. The ratio t_judge/(t_actor+t_judge+t_env) is the
+        # quantity of interest: what fraction of a trajectory's blocking time is
+        # spent waiting on the judge vs. the agent's own generation.
         t_actor = 0.0
-        t_user_sim = 0.0
-        t_tool = 0.0
+        t_judge = 0.0
+        t_env = 0.0
 
-        # env.reset triggers the user-simulator LLM call, which can raise
-        # transient network errors (httpcore.ReadError, etc.) that tau-bench's
-        # user.py retry loop does not catch. Guard it here so one flaky sample
-        # doesn't take down the whole asyncio.gather in generate_and_rm_group.
+        # env.reset materializes the workspace overlay (disk I/O). Guard it so one
+        # flaky sample doesn't take down the whole asyncio.gather.
         try:
             _t0 = time.monotonic()
             obs, info = await self._initialize_environment(env, task_index)
-            t_user_sim += time.monotonic() - _t0
+            t_env += time.monotonic() - _t0
         except Exception as e:
             logger.warning(f"env.reset failed for task {task_index}: {e.__class__.__name__}: {e}")
             reset_info = {
@@ -942,11 +898,8 @@ class TrainableAgentMixin:
         for _ in range(max_num_steps):
             # Re-render the current message list each turn. In think-ON mode
             # _render_messages_text strips `<think>` from every historical
-            # assistant turn (the sampling render keeps NO turn's think, since the
-            # turn we're about to sample isn't in `messages` yet), so the context
-            # grows sub-linearly in the number of tool calls instead of carrying
-            # every turn's full CoT — which the bare template would do for a tool
-            # chain (tool-response turns don't advance last_query_index).
+            # assistant turn, so the context grows sub-linearly in the number of
+            # tool calls instead of carrying every turn's full CoT.
             input_text = self._render_messages_text(state, messages, add_generation_prompt=True)
 
             payload = {
@@ -997,11 +950,9 @@ class TrainableAgentMixin:
             })
 
             # If sglang hit max_new_tokens we intentionally stop here instead
-            # of handing a half-written message to the user simulator — that
-            # feedback loop is what produced the word-salad responses before.
-            # The truncated turn's training signal is later dropped by
-            # _build_training_tensor (its render is unreliable when </think>
-            # never closed).
+            # of handing a half-written message to the environment. The truncated
+            # turn's training signal is later dropped by _build_training_tensor
+            # (its render is unreliable when </think> never closed).
             if finish_type == "length":
                 num_length_trunc += 1
                 res.status = Status.TRUNCATED
@@ -1023,30 +974,27 @@ class TrainableAgentMixin:
 
             agent_content, calls = parsed["normal_text"], parsed["calls"]
             # think-ON: the parser's normal_text still carries the reasoning +
-            # </think>. Strip it so the user simulator sees ONLY the agent's
-            # visible reply, not its internal monologue (else GLM echoes the
-            # agent voice and the dialogue loops). No-op for no-think turns.
-            # Only affects the copy sent to the env/user-sim; the trained
-            # cur_response (recorded above) keeps the full text for loss-mask.
+            # </think>. Strip it so the env / logs see ONLY the agent's visible
+            # reply, not its internal monologue. No-op for no-think turns. Only
+            # affects the copy sent to the env; the trained cur_response (recorded
+            # above) keeps the full text for loss-mask.
             agent_content = _strip_think_for_user(agent_content)
             action = call_to_action_sglang(calls, agent_content)
 
-            # A RESPOND action sends the agent's reply to the user simulator and
-            # blocks on its LLM reply; any other action is a local tool invoke.
-            # Attribute the env.step wall-time to the matching bucket. (The
-            # terminal RESPOND/tool step also replays gt actions for reward; that
-            # cost is local and folds into whichever bucket this step lands in.)
-            is_user_sim_step = action.name == RESPOND_ACTION_NAME
+            # The terminal `finish` action's env.step runs the BLOCKING Bedrock
+            # rubric judge (the reward); every other action is a local file-tool
+            # invoke. Attribute the env.step wall-time to the matching bucket.
+            is_judge_step = action.name == FINISH_TOOL_NAME
             try:
                 _t0 = time.monotonic()
                 env_response = await self._execute_tool(env, action)
                 _dt = time.monotonic() - _t0
-                if is_user_sim_step:
-                    t_user_sim += _dt
+                if is_judge_step:
+                    t_judge += _dt
                 else:
-                    t_tool += _dt
+                    t_env += _dt
             except Exception as e:
-                logger.warning("Environment step failed (typically a user simulator call error).")
+                logger.warning("Environment step failed (typically a judge call error).")
                 logger.warning(f"Error: {e}")
                 res.status = Status.ABORTED
                 break
@@ -1079,8 +1027,6 @@ class TrainableAgentMixin:
         # Per-turn format check: every assistant turn must look like
         #   [<think>...</think>]<tool_call>...</tool_call>   or
         #   [<think>...</think>]{plain text}
-        # (the <think> prefix is optional — this is a no-think agent and the
-        # chat template strips historical <think> anyway; see regex block).
         # If any turn fails, subtract an additive penalty from the task reward.
         # We charge winners more than losers (see FORMAT_BAD_PENALTY_* above):
         # the old multiplicative form left 0-reward failures unpunished, so we
@@ -1092,10 +1038,8 @@ class TrainableAgentMixin:
             penalty = FORMAT_BAD_PENALTY_SUCCESS if raw_task_reward > 0 else FORMAT_BAD_PENALTY_FAIL
             total_reward = total_reward - penalty
 
-        # Direct CoT-length penalty: discourage verbose <think> blocks even
-        # when the trajectory completes inside the length cap. Without this,
-        # the model can keep growing CoT as long as it eventually finishes,
-        # and the indirect "truncation = -0.2" signal only fires at the cliff.
+        # Direct CoT-length penalty: DISABLED (cap=0). We still measure
+        # avg_think_chars for wandb monitoring.
         total_think_chars = 0
         for msg in messages:
             if msg.get("role") != "assistant":
@@ -1133,18 +1077,18 @@ class TrainableAgentMixin:
         info["align_fail_turns"] = int(getattr(self, "_last_align_fail_turns", 0))
         info["enable_thinking"] = int(self._enable_thinking)
 
-        # ── Rollout time-attribution: actor self-rollout vs. waiting on the user
-        # simulator (see the t_* accumulators above). Surfaced to wandb by
-        # compute_metrics_from_samples; the headline number the operator wants is
-        # rollout/traj_user_sim_time_frac/mean — the fraction of a trajectory's
-        # blocking time spent waiting for the user simulator to reply.
-        traj_blocking_time = t_actor + t_user_sim + t_tool
+        # ── Rollout time-attribution: actor self-rollout vs. waiting on the rubric
+        # judge (see the t_* accumulators above). Surfaced to wandb by
+        # compute_metrics_from_samples; the headline number is
+        # rollout/traj_judge_time_frac/mean — the fraction of a trajectory's
+        # blocking time spent waiting for the Bedrock judge to score the rubrics.
+        traj_blocking_time = t_actor + t_judge + t_env
         info["traj_actor_time"] = float(t_actor)
-        info["traj_user_sim_time"] = float(t_user_sim)
-        info["traj_tool_time"] = float(t_tool)
+        info["traj_judge_time"] = float(t_judge)
+        info["traj_env_time"] = float(t_env)
         info["traj_blocking_time"] = float(traj_blocking_time)
-        info["traj_user_sim_time_frac"] = (
-            float(t_user_sim / traj_blocking_time) if traj_blocking_time > 0 else 0.0
+        info["traj_judge_time_frac"] = (
+            float(t_judge / traj_blocking_time) if traj_blocking_time > 0 else 0.0
         )
         info["traj_actor_time_frac"] = (
             float(t_actor / traj_blocking_time) if traj_blocking_time > 0 else 0.0
@@ -1174,19 +1118,6 @@ class TrainableAgentMixin:
     ) -> InteractionResult:
         """
         Build the final interaction result with all collected data.
-
-        Args:
-            res: InteractionResult instance to populate
-            total_reward: Total reward accumulated during interaction
-            info: Environment info dictionary
-            messages: Complete conversation messages
-            loss_masks: Loss masks for training
-            prompt_token_ids: Prompt token IDs
-            response_token_ids: Response token IDs
-            rollout_log_probs: Per-token log probs for TIS (agent tokens real, env tokens 0.0)
-
-        Returns:
-            Populated InteractionResult
         """
         res.reward = total_reward
         res.info = info
@@ -1217,9 +1148,8 @@ class TrainableToolCallingAgent(ToolCallingAgent, TrainableAgentMixin):
     """
     A trainable version of ToolCallingAgent that uses sglang rollout for training.
 
-    This agent combines the original ToolCallingAgent functionality with the
-    TrainableAgentMixin to support async interaction with sglang servers for
-    reinforcement learning training.
+    This agent combines the ToolCallingAgent shell with the TrainableAgentMixin to
+    support async interaction with sglang servers for reinforcement learning.
     """
 
     def __init__(

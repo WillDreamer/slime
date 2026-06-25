@@ -13,12 +13,22 @@
 # below the power threshold. (train_async asserts NOT colocate, so this MUST run
 # disaggregated; --rollout-nodes > 0 is required.)
 #
-# Everything else matches the sync script: Qwen3.5-4B-Base, tau retail indices,
+# Everything else matches the sync/mtp scripts: Qwen3.5-4B-Base, tau retail indices,
 # generate_with_tau.generate (multi-turn tool-use), the user simulator selected
 # by TAU_USER_STRATEGY (default "local" = in-cluster GLM-4.7-Flash via a GENERATED
 # multi-model --sglang-config; "claude" = Bedrock), enable_thinking=False (in
 # trainable_agents.py), --log-probs-chunk-size 1024, PYTORCH_CUDA_ALLOC_CONF=
 # expandable_segments, the EFA/NCCL runtime-env, and the hardened GPU-reg wait.
+#
+# SYNCED FROM sync/mtp scripts (this is the async + ALL rollout optimizations file):
+#   * TP=2 (was a stale TP=1 here) — shards the [T,V=248320] fp32 logits head so
+#     the multi-turn entropy step doesn't OOM (job 812f6961).
+#   * EAGLE/MTP speculative decoding for the ACTOR rollout (strict-scoped into the
+#     actor server-group overrides; NEVER leaks into the frozen GLM user_sim).
+#     Lossless. Toggle off with --env TAU_SPEC_DECODING=off.
+#   * Router session-affinity knob: --env TAU_ROUTER_POLICY=consistent_hashing makes
+#     all turns of a trajectory reuse one worker's prefix cache (cuts the repeated
+#     prefill that speculative decode does NOT accelerate). Default cache_aware.
 #
 # Submit — LOCAL user-sim (disaggregated REQUIRED; 6 nodes = 1 train + 5 rollout;
 # --user-sim-nodes 1 => rollout splits into 32 GPU actor + 8 GPU GLM user_sim = 40):
@@ -71,10 +81,10 @@ echo "Detected ${NUM_GPUS} GPUs for this run"
 
 ROLLOUT_BATCH_SIZE=32
 GLOBAL_BATCH_SIZE=256
-# _nothink_async: enable_thinking=False fix + train_async.py (rollout/train
-# overlap). Fresh group so async metrics + rollout-debug dumps don't mix with
-# the sync run's.
-WANDB_GROUP="tau_rl_Qwen35-4B_nothink_async_bs_${ROLLOUT_BATCH_SIZE}"
+# _async_mtp: enable_thinking=1 fix + train_async.py (rollout/train
+# overlap) + EAGLE/MTP speculative decode + session-affinity routing. Fresh group
+# so these metrics + rollout-debug dumps don't mix with the sync / plain-async runs.
+WANDB_GROUP="tau_Qwen35-4B_async_mtp_bs_${ROLLOUT_BATCH_SIZE}"
 
 # train_async.py REQUIRES disaggregated (it asserts not args.colocate). The
 # Greenland bootstrap exports ROLLOUT_NUM_GPUS>0 only when submitted with
@@ -107,6 +117,52 @@ export TAU_USER_STRATEGY="${TAU_USER_STRATEGY:-local}"
 export TAU_ENV="${TAU_ENV:-retail}"
 export TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-train}"
 export TAU_TOOL_PARSER="${TAU_TOOL_PARSER:-qwen3_coder}"
+# enable_thinking hyperparameter — DEFAULT 1 (think-ON).
+# HISTORY: think-ON first CRASHED job 221858c8 — NOT a token-alignment bug, but
+# the FORMAT CHECK: Qwen3.5 puts the opening <think> in the generation PROMPT, so
+# each turn is an ORPHAN </think> (response <think>=0, </think>=1). The old
+# _assistant_turn_format_ok regex REQUIRED the opening tag → judged every turn
+# format-bad (format_ok=0 on all 1435 real turns) → reward penalty → zero-variance
+# groups → dynamic-sampling filtered them all → empty DP micro-batch → torch.cat([])
+# ValueError. FIXED 2026-06-22: _THINK_PREFIX now accepts the orphan-close shape
+# (verified on the real think-ON trajectory: format_ok 0.000→0.997). Token
+# alignment was already fine (align_fail_turns=0.135, frac_trained=0.42), so
+# _build_training_tensor was NOT changed. Set TAU_ENABLE_THINKING=0 for no-think.
+# STILL VERIFY ON LIVE wandb: watch rollout/frac_trained early — if it collapses,
+# stop and set 0 (see memory slime-think-token-loss-mask).
+export TAU_ENABLE_THINKING="${TAU_ENABLE_THINKING:-1}"
+# Strip historical-turn <think> from the multi-turn context (think-ON only).
+# DEFAULT 1. The Qwen3.5 template only drops a turn's <think> once a LATER real
+# user turn advances last_query_index, and tau's tool-response turns DON'T advance
+# it — so a pure tool chain otherwise carries every turn's full CoT in both the
+# trained tokens AND the re-fed context. trainable_agents._render_messages_text
+# pre-strips reasoning from all but the turn being generated/trained. Set 0 for
+# the legacy full-CoT-every-turn behavior. No-op when think is OFF.
+export TAU_STRIP_HISTORICAL_THINK="${TAU_STRIP_HISTORICAL_THINK:-1}"
+# How the LOCAL user-sim requests no-think. GLM-4.7-Flash may 400 on the
+# Qwen-style chat_template_kwargs key "enable_thinking" (suspected cause of a
+# 26.5k-deterministic-400 user-sim run). Default "off" = send no kwarg (GLM's
+# reasoning_parser glm45 keeps CoT out of content anyway). Set to enable_thinking
+# or thinking to A/B if GLM needs an explicit key.
+export TAU_USER_THINK_KWARG="${TAU_USER_THINK_KWARG:-off}"
+# LOCAL user-sim sampling temperature. DEFAULT 0.7 (was 0.0): greedy decoding made
+# the GLM user-sim echo the same line every turn -> 30-turn death loops -> reward
+# -0.2 on ~44% of trajectories. 0.7 lets it break out. (Bedrock/claude path keeps
+# its own default and drops temperature on 4.7/4.8.)
+export TAU_USER_TEMP="${TAU_USER_TEMP:-0.7}"
+# LOCAL user-sim max_tokens (read by user.py::LocalUserSimulationEnv). DEFAULT
+# 16384 (was the code default 1000). WHY: GLM-4.7-Flash runs thinking-ON by
+# default (its chat template appends a literal `<think>` to the generation prompt
+# unless enable_thinking=false; we send NO no-think kwarg because TAU_USER_THINK_KWARG
+# defaults to "off"). With only 1000 tokens the model burns the whole budget inside
+# the `<think>` reasoning and gets truncated BEFORE emitting any post-think answer;
+# the glm45 reasoning_parser then routes all of it to `reasoning_content`, leaving
+# `content` EMPTY — which user.py raises as "empty completion from local user-sim",
+# retries 8x, then aborts the WHOLE trajectory (job 0b483c04: ~57% of user-sim
+# calls came back empty -> mass aborts -> the empty-sample train crash). 16k gives
+# thinking room to finish AND still produce the one-line user turn. Mirrored into
+# TAU_ENV_JSON below so worker-node rollout actors inherit it.
+export TAU_USER_MAX_TOKENS="${TAU_USER_MAX_TOKENS:-16384}"
 
 if [ "${TAU_USER_STRATEGY}" = "claude" ]; then
     # Bedrock Claude user-sim (cross-region; needs the boto3 credential chain).
@@ -161,13 +217,25 @@ fi
 # Disaggregated vs colocate memory budgets (same logic as the math _mns script).
 # ROLLOUT_NUM_GPUS is exported by the Greenland bootstrap (0 / unset = colocate).
 if [ "${ROLLOUT_NUM_GPUS:-0}" -gt 0 ]; then
-    # 15360 OOM'd在训练侧 logits 步(base job 962645): empty_strided_cuda((s10,1,248320),
-    # fp32) 要 15.28GiB 分不出(vocab=248320 巨大,fp32 logits 峰值 ∝ max-tokens)。
-    # 降回 9216(同模型同 vocab,OOM 同理),对齐 base _mns 脚本。
-    MAX_TOKENS_PER_GPU=9216
+    # MAX_TOKENS_PER_GPU bumped 9216 -> 20480 (env-overridable). WHY: with 9216 the
+    # multi-turn(+think) trajectories are far longer than one bin (real think-ON
+    # rollout: total_length mean 11783, max 27134; 169/251 samples > 9216). The DP
+    # bin-packer (first_fit_pack -> expand_bins_by_splitting) then can't split bins
+    # to a multiple of dp_size without some bin staying a lone oversized sample, and
+    # get_seqlen_balanced_partitions hands a rank ZERO bins -> data.py torch.cat([])
+    # -> "expected a non-empty list of Tensors" (crashed jobs 221858c8 / 297e778c at
+    # the first rollout's ref_log_probs). 20480 covers ~p95 (21372): only 19/251
+    # samples still exceed it (acceptable long-tail), and bins now hold multiple
+    # samples so the split/distribute stays non-empty.
+    # OOM SAFETY: 15360 OOM'd historically ONLY because the entropy step did a
+    # second full [T,V=248320] fp32 alloc (logits.clone()+_VocabParallelEntropy,
+    # ~21GiB doubling). That is now bounded by --log-probs-chunk-size 1024 ([chunk,V]
+    # ~1GiB), so the remaining logits term is just the single forward [T,V]: at
+    # 20480, TP=2 -> fp32 ~10.2GB (well under H200 140GB). Lower via env if tight.
+    MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
     SGLANG_MEM_FRACTION=0.85
 else
-    MAX_TOKENS_PER_GPU=9216
+    MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-9216}
     SGLANG_MEM_FRACTION=0.7
 fi
 
@@ -180,7 +248,7 @@ CKPT_ARGS=(
    # so the no-think behavior is trained from the base, not resumed off the old
    # thinking-on run. (Matches the math _mns from-scratch pattern.)
    --load ${MODEL_ROOT}/Qwen3.5/Qwen3.5-4B-Base_torch_dist/
-   --save ${MODEL_ROOT}/AECE/Qwen3.5-4B-Base-Tau-nothink-async/
+   --save ${MODEL_ROOT}/AECE/Qwen3.5-4B-Base-Tau-async-mtp/
    # Save every 5 steps; permanently RETAIN every 20th (--save-retain-interval
    # must be a multiple of --save-interval, validated by Megatron). The
    # non-retained saves roll with a window of 1, so disk holds the latest frequent
@@ -198,9 +266,9 @@ ROLLOUT_ARGS=(
    --prompt-data "${DATA_ROOT}/tau-bench/retail_train_tasks.jsonl"
    --input-key index
    --rollout-shuffle
-   --num-rollout 500
+   --num-rollout 300
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
-   --n-samples-per-prompt 8
+   --n-samples-per-prompt 16
    --rollout-max-response-len 2048
    --rollout-temperature 1
    --global-batch-size ${GLOBAL_BATCH_SIZE}
@@ -211,7 +279,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval 5
    --eval-prompt-data retail-dev "${DATA_ROOT}/tau-bench/retail_dev_tasks.jsonl"
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 2048
@@ -219,10 +287,17 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 1
+   # TP=2 (was 1): job 812f6961 OOM'd on train step 4 at the entropy clone with
+   # only ~940MiB short (GPU 0 at 126.85/139.72 GiB). The [T, V=248320] fp32 logits
+   # head is the OOM main term; TP=2 shards vocab -> halves that peak. TP ceiling is
+   # 4 here (--num-query-groups 4 must be divisible by TP). The 24 GatedDeltaNet
+   # linear-attn layers are duplicated (not sharded) under TP — correct but no mem
+   # saving there; the logits head IS sharded, which is what matters for this OOM.
+   # (Synced from the sync/mtp scripts, which already bumped TP=1->2 for this OOM.)
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
@@ -242,13 +317,19 @@ PERF_ARGS=(
    # buffer to [chunk, V] (~1GiB at 1024) — numerically identical (per-token values
    # are independent), and does NOT touch rollout-batch-size / seq-len /
    # max-tokens-per-gpu. The math run never hit this (single-turn -> shorter T).
-   --log-probs-chunk-size 1024
+   --log-probs-chunk-size 4096
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.00
+   # KL anchor to the ref model (Qwen3.5-4B-Base). Was 0.00 (no constraint) — the
+   # reward-collapse run diverged precisely because nothing pulled the policy back
+   # toward ref: entropy/grad_norm/kl_loss ran away (kl_loss hit ~0.57 while the
+   # coef was 0, so it never fed back into the loss) and responses degenerated to
+   # word-salad. 0.01 is a light leash that penalizes drift without dominating the
+   # task signal. Tunable via env (try 0.005–0.02) without editing the script.
+   --kl-loss-coef ${TAU_KL_LOSS_COEF:-0.01}
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
@@ -274,6 +355,22 @@ WANDB_ARGS=(
    --disable-wandb-random-suffix
 )
 
+# ── Router policy / session affinity (synced from sync/mtp scripts) ──
+# TAU_ROUTER_POLICY selects the SGLang router's load-balancing policy:
+#   cache_aware        (default) — route by live prefix-cache state. Unchanged
+#                       behaviour; this is the router's own implicit default.
+#   consistent_hashing            — SESSION AFFINITY for the multi-turn rollout:
+#                       all turns of one trajectory share an X-SMG-Routing-Key
+#                       (set in trainable_agents.asolve) and hash to the SAME
+#                       worker, so each turn reuses that worker's prefix cache
+#                       instead of re-prefilling the whole growing history. This
+#                       targets the prefill cost that EAGLE/MTP does NOT speed up
+#                       (complementary to the speculative-decode speedup below).
+#   round_robin                   — ignore cache (diagnostic).
+# Carried into the actor request path via --router-policy (a real slime arg now;
+# it drives both the router launch AND the per-request routing-key header).
+export TAU_ROUTER_POLICY="${TAU_ROUTER_POLICY:-cache_aware}"
+
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION}
@@ -281,18 +378,64 @@ SGLANG_ARGS=(
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    # custom all-reduce CUDA-graph capture fails on this H200/driver -> disable
    --sglang-disable-custom-all-reduce
+   --router-policy ${TAU_ROUTER_POLICY}
 )
+
+# ── MTP / EAGLE speculative decoding (synced from the _mtp script) ──
+# Qwen3.5 ships a built-in MTP (nextn) head; EAGLE uses it as the draft (NO
+# separate draft-model path, exactly like scripts/run-qwen3.5-27B.sh). Toggle
+# with TAU_SPEC_DECODING=off to fall back to plain rollout. Knobs default to the
+# validated 27B values. These are injected with STRICT SCOPING:
+#   * LOCAL  path -> only into the actor server-group `overrides:` of the
+#                    generated multi-model YAML (NOT global -> never reaches the
+#                    GLM-4.7-Flash user_sim, which has no matching MTP draft).
+#   * CLAUDE path -> appended to the global SGLANG_ARGS (single actor model, no
+#                    YAML, no user_sim -> nothing to leak into; and the global arg
+#                    being set also makes spec_accept_rate metrics log).
+# EAGLE is training-LOSSLESS (accepted draft tokens are verified against the
+# target model), so the trained policy / GRPO math are unchanged vs the non-mtp
+# async run; this only speeds up generation. (The draft head is frozen at base
+# init via enable_draft_weights_cpu_backup; accept rate decays as policy drifts
+# but correctness is never affected — see the _mtp script header.)
+TAU_SPEC_DECODING="${TAU_SPEC_DECODING:-eagle}"
+SPEC_NUM_STEPS=${SPEC_NUM_STEPS:-3}
+SPEC_EAGLE_TOPK=${SPEC_EAGLE_TOPK:-1}
+SPEC_NUM_DRAFT_TOKENS=${SPEC_NUM_DRAFT_TOKENS:-4}
+MAMBA_SCHED_STRATEGY="${MAMBA_SCHED_STRATEGY:-extra_buffer}"
+
+# Build the actor server-group `overrides:` YAML fragment (local path only).
+# Indentation: server-group item lives at 6 spaces, its children at 8, override
+# keys at 10 — must match the actor block below. Underscore keys avoid the
+# hyphen->underscore normalization warning (sglang_engine.py:626).
+ACTOR_SPEC_OVERRIDES=""
+if [ "${TAU_SPEC_DECODING}" = "eagle" ]; then
+   ACTOR_SPEC_OVERRIDES=$(cat <<SPECEOF
+        overrides:
+          speculative_algorithm: EAGLE
+          speculative_num_steps: ${SPEC_NUM_STEPS}
+          speculative_eagle_topk: ${SPEC_EAGLE_TOPK}
+          speculative_num_draft_tokens: ${SPEC_NUM_DRAFT_TOKENS}
+          mamba_scheduler_strategy: ${MAMBA_SCHED_STRATEGY}
+SPECEOF
+)
+   echo "[tau] EAGLE speculative decoding ENABLED for the actor (steps=${SPEC_NUM_STEPS}, topk=${SPEC_EAGLE_TOPK}, draft_tokens=${SPEC_NUM_DRAFT_TOKENS}, mamba_scheduler=${MAMBA_SCHED_STRATEGY})"
+else
+   echo "[tau] EAGLE speculative decoding DISABLED (TAU_SPEC_DECODING=${TAU_SPEC_DECODING}) — plain rollout"
+fi
+
 # LOCAL user-sim: deploy a 2nd (frozen) user-simulation model (GLM-4.7-Flash)
 # alongside the actor via a multi-model --sglang-config. The YAML is GENERATED
 # here because the GPU split depends on USER_SIM_NUM_GPUS (= --user-sim-nodes*8,
 # exported by the Greenland bootstrap; default 8 = one node for a dev-box run).
-#   actor model    = ROLLOUT_NUM_GPUS - USER_SIM_NUM_GPUS  (TP=4, inherits SGLANG_ARGS)
+#   actor model    = ROLLOUT_NUM_GPUS - USER_SIM_NUM_GPUS  (TP=4, inherits SGLANG_ARGS
+#                    + EAGLE overrides from ACTOR_SPEC_OVERRIDES)
 #   user_sim model = USER_SIM_NUM_GPUS                      (GLM-4.7-Flash, TP=4, frozen)
 # The two MUST sum to ROLLOUT_NUM_GPUS (slime validates this at rollout.py:1216).
 # GLM-4.7-Flash SGLang config follows the model's HF page (zai-org/GLM-4.7-Flash):
 # tp-size 4, tool-call-parser glm47, reasoning-parser glm45, served-model-name,
 # mem-fraction-static 0.8. Speculative (EAGLE/MTP) is intentionally OMITTED for
-# the user-sim (simpler/robust; can be added later via overrides).
+# the user-sim (it is FROZEN and has no matching MTP draft; keeping it clean is
+# exactly the strict-scoping requirement).
 USER_SIM_NUM_GPUS=${USER_SIM_NUM_GPUS:-0}
 if [ "${TAU_USER_STRATEGY}" = "local" ]; then
    if [ "${USER_SIM_NUM_GPUS:-0}" -le 0 ] || [ "${ROLLOUT_NUM_GPUS:-0}" -le 0 ]; then
@@ -318,12 +461,14 @@ if [ "${TAU_USER_STRATEGY}" = "local" ]; then
    cat > "${USER_SIM_YAML}" <<YAMLEOF
 # AUTO-GENERATED by run_qwen35_4b_tau_mns_async.sh — do not edit by hand.
 # rollout split: actor=${ACTOR_ROLLOUT_GPUS} GPU + user_sim=${USER_SIM_NUM_GPUS} GPU = ${ROLLOUT_NUM_GPUS} (= --rollout-num-gpus)
+# actor server-group carries the EAGLE/MTP overrides (strict scoping); user_sim does NOT.
 sglang:
   - name: actor
     update_weights: true
     server_groups:
       - worker_type: regular
         num_gpus: ${ACTOR_ROLLOUT_GPUS}
+${ACTOR_SPEC_OVERRIDES}
   - name: user_sim
     model_path: ${USER_SIM_MODEL_PATH}
     update_weights: false
@@ -341,6 +486,21 @@ YAMLEOF
    echo "[tau] generated multi-model sglang config -> ${USER_SIM_YAML}:"
    cat "${USER_SIM_YAML}"
    SGLANG_ARGS+=( --sglang-config "${USER_SIM_YAML}" )
+else
+   # CLAUDE path (single actor model, no YAML, no user_sim): EAGLE goes into the
+   # GLOBAL SGLANG_ARGS. Safe here (nothing to leak into), and setting the global
+   # arg also enables the spec_accept_rate / spec_accept_length wandb metrics
+   # (slime/utils/types.py:168, rollout.py:1485).
+   if [ "${TAU_SPEC_DECODING}" = "eagle" ]; then
+      SGLANG_ARGS+=(
+         --sglang-speculative-algorithm EAGLE
+         --sglang-speculative-num-steps ${SPEC_NUM_STEPS}
+         --sglang-speculative-eagle-topk ${SPEC_EAGLE_TOPK}
+         --sglang-speculative-num-draft-tokens ${SPEC_NUM_DRAFT_TOKENS}
+         --sglang-mamba-scheduler-strategy ${MAMBA_SCHED_STRATEGY}
+      )
+      echo "[tau] EAGLE appended to global SGLANG_ARGS (claude path)"
+   fi
 fi
 
 MISC_ARGS=(
@@ -496,7 +656,12 @@ TAU_ENV_JSON="
     \"TAU_USER_STRATEGY\": \"${TAU_USER_STRATEGY}\",
     \"TAU_ENV\": \"${TAU_ENV}\",
     \"TAU_TASK_SPLIT\": \"${TAU_TASK_SPLIT}\",
-    \"TAU_TOOL_PARSER\": \"${TAU_TOOL_PARSER}\""
+    \"TAU_TOOL_PARSER\": \"${TAU_TOOL_PARSER}\",
+    \"TAU_ENABLE_THINKING\": \"${TAU_ENABLE_THINKING}\",
+    \"TAU_STRIP_HISTORICAL_THINK\": \"${TAU_STRIP_HISTORICAL_THINK}\",
+    \"TAU_USER_THINK_KWARG\": \"${TAU_USER_THINK_KWARG}\",
+    \"TAU_USER_MAX_TOKENS\": \"${TAU_USER_MAX_TOKENS}\",
+    \"TAU_USER_TEMP\": \"${TAU_USER_TEMP}\""
 if [ "${TAU_USER_STRATEGY}" = "claude" ]; then
     # Bedrock path: forward AWS creds config + region so worker-node boto3 can
     # resolve the same EcsContainer -> greenland-dev-role chain.

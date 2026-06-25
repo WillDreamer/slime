@@ -1375,6 +1375,21 @@ def compute_metrics_from_samples(args, samples):
     if aborted_vals:
         log_dict["aborted_rate"] = np.mean(aborted_vals).item()
 
+    # Rollout time-attribution (tau-bench async path): per-trajectory split of
+    # blocking wall-time across the actor's own SGLang generation vs. waiting on
+    # the user-simulator LLM reply. Populated by trainable_agents.asolve in
+    # info["traj_*"]. Distributions over per-trajectory seconds plus the headline
+    # fraction-of-time-waiting-on-the-user-sim (mean across the batch). Guarded
+    # so it only logs when the tau rollout populated the fields.
+    for _tkey in ("traj_actor_time", "traj_user_sim_time", "traj_tool_time", "traj_blocking_time"):
+        _vals = [s.metadata.get(_tkey) for s in samples if s.metadata.get(_tkey) is not None]
+        if _vals:
+            log_dict |= dict_add_prefix(compute_statistics(_vals), f"{_tkey}/")
+    for _fkey in ("traj_user_sim_time_frac", "traj_actor_time_frac"):
+        _vals = [s.metadata.get(_fkey) for s in samples if s.metadata.get(_fkey) is not None]
+        if _vals:
+            log_dict |= dict_add_prefix(compute_statistics(_vals), f"{_fkey}/")
+
     return log_dict
 
 
