@@ -158,25 +158,32 @@ export TAU_ENABLE_THINKING="${TAU_ENABLE_THINKING:-1}"
 # turn being generated/trained, so only the current turn carries visible CoT.
 # Set 0 to keep the legacy full-CoT-every-turn behavior. No-op when think is OFF.
 export TAU_STRIP_HISTORICAL_THINK="${TAU_STRIP_HISTORICAL_THINK:-1}"
-# How the LOCAL user-sim requests no-think. GLM-4.7-Flash may 400 on the
-# Qwen-style chat_template_kwargs key "enable_thinking" (suspected cause of a
-# 26.5k-deterministic-400 user-sim run). Default "off" = send no kwarg (GLM's
-# reasoning_parser glm45 keeps CoT out of content anyway). Set to enable_thinking
-# or thinking to A/B if GLM needs an explicit key.
-export TAU_USER_THINK_KWARG="${TAU_USER_THINK_KWARG:-off}"
+# How the LOCAL user-sim requests no-think. DEFAULT "enable_thinking" = send
+# {"chat_template_kwargs": {"enable_thinking": false}}. VERIFIED against the real
+# GLM-4.7-Flash chat_template.jinja: its add_generation_prompt arm is
+#   <|assistant|>{{ '</think>' if (enable_thinking is defined and not enable_thinking) else '<think>' }}
+# so the Qwen-style `enable_thinking` key IS honored by GLM-4.7 (the earlier 400
+# fear was a suspicion; the template accepts it). With it FALSE, GLM emits a closed
+# `</think>` immediately and SKIPS the reasoning block entirely — the user-sim then
+# returns its one-line user turn directly, no CoT generated. This is the single
+# biggest rollout-speed lever: with the old "off" (no kwarg) GLM ran thinking-ON
+# and spent most of each reply generating CoT (measured: GLM reply median 1078,
+# max 7868 tokens; traj_user_sim_time_frac median 90% — see memory
+# tau-9b-rollout-slow-usersim-bottleneck). Set "off" to revert (GLM default
+# thinking-ON; reasoning_parser glm45 keeps that CoT out of `content` but still
+# pays its latency), or "thinking" for GLM builds that use that key instead.
+export TAU_USER_THINK_KWARG="${TAU_USER_THINK_KWARG:-enable_thinking}"
 # LOCAL user-sim max_tokens (read by user.py::LocalUserSimulationEnv). DEFAULT
-# 16384 (was the code default 1000). WHY: GLM-4.7-Flash runs thinking-ON by
-# default (its chat template appends a literal `<think>` to the generation prompt
-# unless enable_thinking=false; we send NO no-think kwarg because TAU_USER_THINK_KWARG
-# defaults to "off"). With only 1000 tokens the model burns the whole budget inside
-# the `<think>` reasoning and gets truncated BEFORE emitting any post-think answer;
-# the glm45 reasoning_parser then routes all of it to `reasoning_content`, leaving
-# `content` EMPTY — which user.py raises as "empty completion from local user-sim",
-# retries 8x, then aborts the WHOLE trajectory (job 0b483c04: ~57% of user-sim
-# calls came back empty -> mass aborts -> the empty-sample train crash). 16k gives
-# thinking room to finish AND still produce the one-line user turn. Mirrored into
-# TAU_ENV_JSON below so worker-node rollout actors inherit it.
-export TAU_USER_MAX_TOKENS="${TAU_USER_MAX_TOKENS:-16384}"
+# 1024. WHY this is now SAFE at a small value: with TAU_USER_THINK_KWARG=
+# enable_thinking (above) GLM no longer generates a `<think>` block, so the reply
+# is just the short one-line user turn — it does NOT burn the budget inside CoT.
+# (The old 16384 was a workaround for thinking-ON: with thinking on AND a small
+# cap, GLM truncated mid-CoT, glm45 routed it all to reasoning_content, `content`
+# came back EMPTY -> "empty completion" -> 8x retry -> whole trajectory ABORTED,
+# job 0b483c04. That failure mode is gone once thinking is OFF.) 1024 is ample for
+# a user turn. If reverting to thinking-ON (TAU_USER_THINK_KWARG=off), bump this
+# back to 16384. Mirrored into TAU_ENV_JSON so worker-node actors inherit it.
+export TAU_USER_MAX_TOKENS="${TAU_USER_MAX_TOKENS:-1024}"
 
 if [ "${TAU_USER_STRATEGY}" = "claude" ]; then
     # Bedrock Claude user-sim (cross-region; needs the boto3 credential chain).
