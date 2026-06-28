@@ -1,0 +1,31 @@
+# Auto-resume the tau3 eval (6 servers + 4-lane eval) after every spot stop/start
+# or on a fresh machine. Anchored on the /mnt/old-data3 data EBS volume; the
+# autostart script mounts that volume, points docker data-root at it (reusing the
+# baked image — no pull), brings up the container + servers, and launches the eval.
+#
+# Install once per machine (or bake into the AMI) with:
+#   sudo /mnt/old-data3/home/ec2-user/slime/eval_scai/tau3/aws/install_tau3_autostart.sh
+# Test now:   sudo systemctl start tau3eval
+# Watch:      docker exec tau3-srv tail -f /home/ec2-user/slime/eval_scai/tau3/logs/MASTER.log
+# Disable:    sudo systemctl disable tau3eval
+[Unit]
+Description=tau3 eval auto-resume (servers + 4-lane eval) after spot stop/start
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Environment=HOME=/root
+# Runs from a root-fs copy so it works even before /mnt/old-data3 is mounted
+# (the script mounts the data volume itself as step 0).
+ExecStart=/usr/local/bin/autostart-tau3.sh
+# GLM tp=2 loads off lazy-loaded EBS can take ~30-40 min; happens inside the
+# synchronous health-wait, so keep a generous start timeout.
+KillMode=process
+TimeoutStartSec=4200
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# run outputs — never commit
+logs/
+tau3_rp_results/
+*.nohup
+__pycache__/
+*.pyc
