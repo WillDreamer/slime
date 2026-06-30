@@ -92,6 +92,7 @@ docker exec "$CON" bash -lc '
   python -c "import rank_bm25" 2>/dev/null || pip install rank_bm25 >>/tmp/tau2_install.log 2>&1   # banking_knowledge BM25 retrieval dep
   python /home/ec2-user/slime/aws/_patch_tau2_lenient_args.py   /home/ec2-user/tau2-bench
   python /home/ec2-user/slime/aws/_patch_tau2_first_toolcall.py /home/ec2-user/tau2-bench
+  python /home/ec2-user/slime/aws/_patch_tau2_local_judge.py    /home/ec2-user/tau2-bench   # eval-time LLM calls -> local GLM (offline)
 ' >/tmp/tau3_setup.log 2>&1 || log "WARN: tau2 setup hit an issue (see /tmp/tau3_setup.log)"
 
 # --- 5) wait until the container can see the GPUs ---------------------------

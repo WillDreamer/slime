@@ -27,7 +27,7 @@ MAX_STEPS="${MAX_STEPS:-200}"
 MAX_TOKENS="${MAX_TOKENS:-8192}"
 RUNS="${RUNS:-1 2 3}"
 SPLIT="${SPLIT:-base}"                       # tau3 task split (base|train|test)
-DOMAINS="${DOMAINS:-retail airline telecom mock banking_knowledge}"
+DOMAINS="${DOMAINS:-retail airline telecom mock}"   # banking_knowledge DROPPED: agentic-RAG capability ceiling (~2-3% all ckpts), see analysis. Per-lane domains below override this.
 KB_RETRIEVAL="${KB_RETRIEVAL:-bm25}"         # offline: no_knowledge|full_kb|golden_retrieval|grep_only|bm25
 
 # serving fixes (see TAU2_SEARCH_SETUP.md)
@@ -38,32 +38,44 @@ command -v tau2 >/dev/null || { echo "FATAL: 'tau2' not on PATH -- run _setup_ta
 cd "$TAU2" || { echo "FATAL: no tau2-bench at $TAU2"; exit 1; }
 log(){ echo "[$(date +%F' '%T)] $*" | tee -a "$LOGD/MASTER.log"; }
 
-# name | agent_port | glm_port | extra_stop | first_tool_call(0/1)
+# name | agent_port | glm_port | extra_stop | first_tool_call(0/1) | domains
 # 2 GLM replicas (tp=2) on 7006/7007; 2 agent lanes paired to each.
+# TauSFT-Tau is COMPLETE -> its GPU (7003) now runs a 2nd Search replica.
+# Search is split across 7002 (retail,airline) + 7003 (telecom,mock) to finish ~2x faster.
 LANES=(
-  "qwen-8b-base|7000|7006||0"
-  "Qwen3-8B-Base-Math|7001|7006||0"
-  "Qwen3-8B-Base-Math-SeaSFT-Search|7002|7007|</tool_call>|1"
-  "Qwen3-8B-Base-Math-SeaSFT-Search-TauSFT-Tau|7003|7007||0"
+  "qwen-8b-base|7000|7006||0|retail airline telecom mock"
+  "Qwen3-8B-Base-Math|7001|7006||0|retail airline telecom mock"
+  "Qwen3-8B-Base-Math-SeaSFT-Search|7002|7007|</tool_call>|1|retail airline"
+  "Qwen3-8B-Base-Math-SeaSFT-Search|7003|7007|</tool_call>|1|telecom mock"
 )
 
 run_lane(){
-  local name=$1 ap=$2 gp=$3 estop=$4 first=$5
+  local name=$1 ap=$2 gp=$3 estop=$4 first=$5 doms=$6
+  export TAU2_JUDGE_API_BASE="http://127.0.0.1:$gp/v1"   # NL-assertion reward judge -> this lane's GLM replica (else hits real OpenAI w/ dummy key)
   local stop='"<|im_end|>"'; [ -n "$estop" ] && stop="\"$estop\",\"<|im_end|>\""
   local AARGS="{\"temperature\":0,\"max_tokens\":$MAX_TOKENS,\"stop\":[$stop],\"api_base\":\"http://127.0.0.1:$ap/v1\"}"
   local UARGS="{\"temperature\":0,\"max_tokens\":$MAX_TOKENS,\"api_base\":\"http://127.0.0.1:$gp/v1\"}"
   local FC=""; [ "$first" = "1" ] && FC="TAU2_FIRST_TOOL_CALL=1"
-  for i in $RUNS; do for d in $DOMAINS; do
+  for i in $RUNS; do for d in $doms; do
     local SAVE="tau3rp_${name}_${d}_run${i}"
     # knowledge domain needs an (offline) retrieval config
     local EXTRA=""; [ "$d" = "banking_knowledge" ] && EXTRA="--retrieval-config $KB_RETRIEVAL"
+    # mock = synthetic test domain whose task hashes are UNSTABLE -> --auto-resume
+    # always fails ("Tasks were modified") on any pre-existing cell, leaving partial
+    # cells unfinishable. It's tiny/fast, so run it fresh every time: drop
+    # --auto-resume and clear any prior (possibly partial) cell first.
+    local RESUME="--auto-resume"
+    if [ "$d" = "mock" ]; then
+      RESUME=""
+      rm -rf "$TAU2/data/simulations/$SAVE" "$OUTD/$SAVE" 2>/dev/null || true
+    fi
     log "[$name:$ap] $d run$i split=$SPLIT $EXTRA -> $SAVE"
     env $FC tau2 run --domain "$d" \
       --task-split-name "$SPLIT" $EXTRA \
       --agent-llm "openai/$name"          --agent-llm-args "$AARGS" \
       --user-llm  "openai/GLM-4.7-Flash"  --user-llm-args  "$UARGS" \
       --num-trials "$NUM_TRIALS" --max-concurrency "$CONC" --max-steps "$MAX_STEPS" \
-      --auto-resume --save-to "$SAVE" > "$LOGD/${SAVE}.log" 2>&1
+      $RESUME --save-to "$SAVE" > "$LOGD/${SAVE}.log" 2>&1
     log "[$name:$ap] $d run$i rc=$? -> $SAVE"
     cp -r "$TAU2/data/simulations/$SAVE" "$OUTD/" 2>/dev/null || true
   done; done
@@ -72,8 +84,8 @@ run_lane(){
 
 pids=()
 for L in "${LANES[@]}"; do
-  IFS='|' read -r n a g e f <<< "$L"
-  run_lane "$n" "$a" "$g" "$e" "$f" &
+  IFS='|' read -r n a g e f dom <<< "$L"
+  run_lane "$n" "$a" "$g" "$e" "$f" "$dom" &
   pids+=($!)
 done
 wait "${pids[@]}"

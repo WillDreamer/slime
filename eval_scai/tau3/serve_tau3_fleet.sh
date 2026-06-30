@@ -15,14 +15,14 @@ LOG_DIR="${LOG_DIR:-/home/ec2-user/slime/eval_scai/tau3/logs/fleet}"
 mkdir -p "${LOG_DIR}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
 GLM_MODEL="${GLM_MODEL:-zai-org/GLM-4.7-Flash}"
-GLM_CTX="${GLM_CTX:-32768}"     # bound KV cache (model max is 202k; user-sim turns are short)
+GLM_CTX="${GLM_CTX:-65536}"     # was 32768 -> long retail/telecom/banking convos overflowed the user-sim (infra errors). GLM native max is 202k; 65536 gives headroom.
 
 # gpu(s)  port  hf-model-path                                          served-name  tp
 AGENTS=(
   "0 7000 Qwen/Qwen3-8B-Base                                     qwen-8b-base                                  1"
   "1 7001 willhx/Qwen3-8B-Base-Math                              Qwen3-8B-Base-Math                            1"
   "2 7002 willhx/Qwen3-8B-Base-Math-SeaSFT-Search                Qwen3-8B-Base-Math-SeaSFT-Search              1"
-  "3 7003 willhx/Qwen3-8B-Base-Math-SeaSFT-Search-TauSFT-Tau     Qwen3-8B-Base-Math-SeaSFT-Search-TauSFT-Tau   1"
+  "3 7003 willhx/Qwen3-8B-Base-Math-SeaSFT-Search                Qwen3-8B-Base-Math-SeaSFT-Search              1"
 )
 # gpus   port  tp
 USERSIMS=(
