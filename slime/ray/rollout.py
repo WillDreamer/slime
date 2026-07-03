@@ -390,6 +390,96 @@ class RolloutManager:
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
 
+        self._init_length_curriculum()
+
+    def _init_length_curriculum(self):
+        """Entropy-/truncation-gated response-length curriculum (off unless --use-length-curriculum).
+
+        Mitigates reverse-KL OPD length runaway (arXiv:2605.16826): start at a short
+        generation horizon and only extend it once the model is stable at the current
+        horizon (low truncation AND teacher entropy still high). State lives on this
+        persistent actor; each rollout the chosen horizon is pushed into both
+        ``args.rollout_max_response_len`` and the live sglang GenerateState sampling
+        params. Eval is untouched (it uses the eval-config max_response_len).
+        """
+        self._lc_enabled = getattr(self.args, "use_length_curriculum", False)
+        if not self._lc_enabled:
+            return
+        max_len = getattr(self.args, "length_curriculum_max_len", None) or self.args.rollout_max_response_len
+        self._lc_max_len = int(max_len)
+        init_len = getattr(self.args, "length_curriculum_init_len", None) or self.args.rollout_max_response_len
+        self._lc_cur_len = min(int(init_len), self._lc_max_len)
+        self._lc_increment = int(getattr(self.args, "length_curriculum_increment", 512))
+        self._lc_interval = max(1, int(getattr(self.args, "length_curriculum_interval", 5)))
+        self._lc_trunc_max = float(getattr(self.args, "length_curriculum_trunc_max", 0.3))
+        self._lc_entropy_min = float(getattr(self.args, "length_curriculum_entropy_min", 0.0))
+        self._lc_last_trunc = None
+        self._lc_last_entropy = None
+        self._lc_last_grow_rollout = 0
+        # start the run at the short horizon
+        self.args.rollout_max_response_len = self._lc_cur_len
+        logger.info(
+            f"[length-curriculum] enabled: init={self._lc_cur_len} max={self._lc_max_len} "
+            f"increment={self._lc_increment} every={self._lc_interval} rollouts "
+            f"gate(trunc<={self._lc_trunc_max}, teacher_ent>={self._lc_entropy_min})"
+        )
+
+    def _set_generate_max_new_tokens(self, n):
+        """Push the current horizon into the live sglang sampling params (same-process singleton)."""
+        try:
+            from slime.rollout.sglang_rollout import GenerateState
+            from slime.utils.misc import SingletonMeta
+
+            inst = SingletonMeta._instances.get(GenerateState)
+            if inst is not None:
+                inst.sampling_params["max_new_tokens"] = n
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"[length-curriculum] could not update sglang sampling params: {e}")
+
+    def _apply_length_curriculum(self, rollout_id):
+        """Before a rollout: maybe advance the horizon, then apply it to args + sglang."""
+        if not getattr(self, "_lc_enabled", False):
+            return
+        if self._lc_cur_len < self._lc_max_len and rollout_id >= self._lc_last_grow_rollout + self._lc_interval:
+            trunc_ok = self._lc_last_trunc is None or self._lc_last_trunc <= self._lc_trunc_max
+            ent_ok = self._lc_last_entropy is None or self._lc_last_entropy >= self._lc_entropy_min
+            if trunc_ok and ent_ok:
+                self._lc_cur_len = min(self._lc_max_len, self._lc_cur_len + self._lc_increment)
+                self._lc_last_grow_rollout = rollout_id
+                logger.info(f"[length-curriculum] rollout {rollout_id}: grow horizon -> {self._lc_cur_len}")
+            else:
+                logger.info(
+                    f"[length-curriculum] rollout {rollout_id}: hold horizon at {self._lc_cur_len} "
+                    f"(last trunc={self._lc_last_trunc}, teacher_ent={self._lc_last_entropy})"
+                )
+        self.args.rollout_max_response_len = self._lc_cur_len
+        self._set_generate_max_new_tokens(self._lc_cur_len)
+
+    def _update_length_curriculum_signals(self, rollout_id, data):
+        """After a rollout: record truncation rate + mean teacher entropy for the next gate."""
+        if not getattr(self, "_lc_enabled", False) or not data:
+            return
+        try:
+            n = len(data)
+            trunc = sum(1 for s in data if getattr(s, "status", None) == Sample.Status.TRUNCATED) / max(1, n)
+            ents = []
+            for s in data:
+                te = getattr(s, "teacher_entropy", None)
+                if te is None:
+                    continue
+                te = te.float() if hasattr(te, "float") else te
+                if len(te) > 0:
+                    ents.append(float(te.mean()))
+            ent = (sum(ents) / len(ents)) if ents else None
+            self._lc_last_trunc = trunc
+            self._lc_last_entropy = ent
+            logger.info(
+                f"[length-curriculum] rollout {rollout_id}: horizon={self._lc_cur_len} "
+                f"trunc={trunc:.3f} teacher_ent={('%.3f' % ent) if ent is not None else 'n/a'}"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"[length-curriculum] signal update failed: {e}")
+
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is running)."""
         if not self._ci_fault_injection_pending:
@@ -463,7 +553,9 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
+        self._apply_length_curriculum(rollout_id)
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        self._update_length_curriculum_signals(rollout_id, data)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
@@ -732,6 +824,12 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        # EOPD: per-token teacher top-k distribution + entropy for the forward-KL term.
+        if getattr(samples[0], "teacher_topk_ids", None) is not None:
+            train_data["teacher_topk_ids"] = [sample.teacher_topk_ids for sample in samples]
+            train_data["teacher_topk_log_probs"] = [sample.teacher_topk_log_probs for sample in samples]
+            train_data["teacher_entropy"] = [sample.teacher_entropy for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -771,6 +869,9 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_topk_ids",
+                "teacher_topk_log_probs",
+                "teacher_entropy",
             ]:
                 if key not in data:
                     continue

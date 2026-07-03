@@ -82,7 +82,7 @@ SEARCH_R1_CONFIGS = {
     "search_concurrency": 256,
     "search_backend": "local",
     "local": {
-        "search_url": "http://127.0.0.1:8000/retrieve",
+        "search_url": "http://131.179.168.117:8000/retrieve",
         "proxy": None,
     },
     "google": {
@@ -769,7 +769,22 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     turn_sampling["stop"] = list(turn_sampling.get("stop") or []) + action_stops
     turn_sampling["no_stop_trim"] = True
 
+    # Optional, OPT-IN via --enforce-total-response-budget (default OFF, so existing
+    # scripts keep their original per-turn behavior unchanged): treat max_new_tokens as a
+    # TOTAL response budget across the search turns by decrementing it each turn. Without
+    # this, the loop applies max_new_tokens PER TURN, so total length can reach
+    # max_turns * max_new_tokens. The response-length curriculum needs this to bind length.
+    enforce_total_budget = getattr(args, "enforce_total_response_budget", False)
+    total_budget = int(turn_sampling.get("max_new_tokens") or 0) if enforce_total_budget else 0
+    tokens_used = 0
+
     for _turn_idx in range(config["max_turns"]):
+        if total_budget > 0:
+            remaining = total_budget - tokens_used
+            if remaining <= 0:
+                exit_reason = "length"
+                break
+            turn_sampling["max_new_tokens"] = remaining
         context = manager.build_context()
         payload: dict = {
             "text": context,
@@ -816,6 +831,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         cur_response, cur_token_ids, cur_log_probs = _truncate_at_first_endoftext(
             state.tokenizer, cur_response, cur_token_ids, cur_log_probs
         )
+        tokens_used += len(cur_token_ids)
 
         if last_finish_reason == "length":
             manager.add_turn(
@@ -945,6 +961,37 @@ async def reward_func(args, sample, **kwargs):
     )
 
     return score
+
+
+# ---------------------------------------------------------------------------
+# Eval generate wrapper — search rollout that ALSO assigns the task reward.
+# ---------------------------------------------------------------------------
+#
+# Why this exists (OPD eval). For a normal search-R1 RL run the launch script
+# sets `--custom-rm-path generate_with_search_tools_qwen_sft_no_drift.reward_func`,
+# so `generate_and_rm` (in sglang_rollout.py) computes the EM task score via
+# `async_rm` for both training rollouts and eval. On-policy distillation runs
+# instead point `--custom-rm-path` at the teacher reward
+# (`slime.rollout.on_policy_distillation.reward_func`, which returns teacher
+# token logprobs / a 0.0 task reward). Because `async_rm` ALWAYS prefers
+# `args.custom_rm_path` when it is set, eval in an OPD run would otherwise score
+# every trajectory with the teacher reward (and need the teacher server up at
+# eval time) — useless as a task-accuracy metric.
+#
+# `generate_and_rm` only calls `async_rm` when `sample.reward is None`. So this
+# wrapper runs the ordinary search rollout via `generate(...)` and then fills in
+# `sample.reward` with the real EM score from `reward_func(...)`. With the reward
+# already set, `async_rm` (and therefore the OPD teacher reward) is skipped, and
+# eval reports genuine search task accuracy without contacting the teacher.
+#
+# Wire it ONLY for eval via the eval dataset config's
+# `custom_generate_function_path` (see examples/on_policy_distillation/
+# eval_search.yaml); training rollout keeps using the plain `generate`.
+async def generate_eval(args, sample: Sample, sampling_params) -> Sample:
+    sample = await generate(args, sample, sampling_params)
+    if sample.status != Sample.Status.ABORTED and sample.reward is None:
+        sample.reward = await reward_func(args, sample)
+    return sample
 
 
 # ---------------------------------------------------------------------------

@@ -372,6 +372,9 @@ def train_one_step(
                 "rollout_log_probs",
                 "max_seq_lens",
                 "teacher_log_probs",
+                "teacher_topk_ids",
+                "teacher_topk_log_probs",
+                "teacher_entropy",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -508,6 +511,10 @@ def train(
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
     """
     args = get_args()
+    # Expose the current rollout id on the global args so step-dependent schedules
+    # (e.g. EOPD forward-KL coef warmup in policy_loss_function) can read it. The loss
+    # receives this same get_args() singleton, so a plain attribute set is visible there.
+    args.current_rollout_id = rollout_id
 
     for iterator in data_iterator:
         iterator.reset()

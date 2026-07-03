@@ -420,6 +420,11 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                # EOPD per-token top-k tensors: 2D ([R, K]) and/or integer ids; the generic
+                # mean-aggregation below cannot reduce them (and .mean() on long ids errors).
+                # teacher_entropy ([R] float) is left in so its mean gets logged.
+                "teacher_topk_ids",
+                "teacher_topk_log_probs",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -438,6 +443,7 @@ def log_rollout_data(
                         "values",
                         "teacher_log_probs",
                         "opd_reverse_kl",
+                        "opd_lowent_frac",
                     ]:
                         val = torch.cat(val).clone().detach()
                         sum_of_sample_mean = get_sum_of_sample_mean(

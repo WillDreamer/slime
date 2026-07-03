@@ -998,6 +998,133 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            # --- Entropy-Aware OPD (EOPD, arXiv:2603.07079) ---
+            # Adds a forward-KL distillation term on high-entropy teacher tokens, on
+            # top of the reverse-KL OPD term (which keeps entering via the advantage).
+            # Requires the EOPD teacher scoring (reward_func_eopd / post_process_rewards_eopd)
+            # so teacher top-k + entropy are available, and context-parallel-size == 1.
+            parser.add_argument(
+                "--use-eopd-forward-kl",
+                action="store_true",
+                default=False,
+                help="Enable the EOPD entropy-gated forward-KL term (in addition to reverse-KL OPD).",
+            )
+            parser.add_argument(
+                "--eopd-fkl-coef",
+                type=float,
+                default=1.0,
+                help="Coefficient for the EOPD forward-KL term. Default 1.0.",
+            )
+            parser.add_argument(
+                "--eopd-entropy-threshold",
+                type=float,
+                default=0.8,
+                help="Teacher per-token entropy (nats) above which the forward-KL term is applied. EOPD uses 0.8.",
+            )
+            parser.add_argument(
+                "--eopd-topk",
+                type=int,
+                default=16,
+                help="Number of teacher top-k tokens used for the EOPD forward-KL distribution. EOPD uses 16.",
+            )
+            # Forward-KL coef warmup: the mode-covering forward-KL transiently over-inflates
+            # student entropy/length while it is still far from the teacher (off-equilibrium),
+            # which is what drives the early length-runaway dip. Ramp the coef up linearly over
+            # the first few rollouts so the model first establishes terminating/low-entropy
+            # structure, then turn on the full mode-covering pressure. warmup-rollouts<=0
+            # disables the schedule (coef == --eopd-fkl-coef from step 0, original behavior).
+            parser.add_argument(
+                "--eopd-fkl-warmup-rollouts",
+                type=int,
+                default=0,
+                help="Linearly ramp the EOPD forward-KL coef from --eopd-fkl-warmup-start-coef "
+                "to --eopd-fkl-coef over this many rollouts. <=0 disables (no warmup).",
+            )
+            parser.add_argument(
+                "--eopd-fkl-warmup-start-coef",
+                type=float,
+                default=0.0,
+                help="Starting EOPD forward-KL coef at rollout 0 when warmup is enabled.",
+            )
+            # ---- v2: complementary entropy gate on the reverse-KL OPD term ----
+            # The forward-KL term above fires on HIGH-entropy teacher tokens (H > threshold). By
+            # default the reverse-KL OPD term (advantage path) fires on ALL tokens, so on high-entropy
+            # tokens the two OVERLAP and fight (forward covers / reverse collapses). This gate restricts
+            # reverse-KL to LOW-entropy teacher tokens (H <= threshold), the exact complement of the
+            # forward-KL gate: high-entropy -> forward-KL (mode-covering / diversity), low-entropy ->
+            # reverse-KL (mode-seeking / sharpening). This is the textbook EOPD entropy split.
+            # Requires EOPD teacher scoring (teacher_entropy available) and context-parallel-size == 1.
+            parser.add_argument(
+                "--use-opd-entropy-gate",
+                action="store_true",
+                default=False,
+                help="Gate the reverse-KL OPD advantage term to LOW-entropy teacher tokens only "
+                "(teacher_entropy <= --opd-entropy-gate-threshold), complementary to the forward-KL "
+                "high-entropy gate. Requires the EOPD reward fns so teacher_entropy is available.",
+            )
+            parser.add_argument(
+                "--opd-entropy-gate-threshold",
+                type=float,
+                default=None,
+                help="Teacher per-token entropy (nats) at or below which the reverse-KL OPD term is "
+                "applied when --use-opd-entropy-gate is set. Defaults to --eopd-entropy-threshold "
+                "(exact complement of the forward-KL gate) when unset.",
+            )
+            # ---- entropy-/truncation-gated response-length curriculum ----
+            # Mitigates reverse-KL OPD length runaway (arXiv:2605.16826): begin at a short
+            # total-response horizon and extend it only when the model is stable at the current
+            # horizon (truncation low AND teacher entropy still high). Off by default.
+            parser.add_argument(
+                "--use-length-curriculum",
+                action="store_true",
+                default=False,
+                help="Enable the entropy-/truncation-gated response-length curriculum.",
+            )
+            parser.add_argument(
+                "--length-curriculum-init-len",
+                type=int,
+                default=2048,
+                help="Initial rollout response-length horizon (total across turns) for the curriculum.",
+            )
+            parser.add_argument(
+                "--length-curriculum-max-len",
+                type=int,
+                default=None,
+                help="Final curriculum horizon. Defaults to --rollout-max-response-len when unset.",
+            )
+            parser.add_argument(
+                "--length-curriculum-increment",
+                type=int,
+                default=512,
+                help="Tokens added to the horizon each time the gate allows an advance.",
+            )
+            parser.add_argument(
+                "--length-curriculum-interval",
+                type=int,
+                default=5,
+                help="Minimum number of rollouts between horizon advances.",
+            )
+            parser.add_argument(
+                "--length-curriculum-trunc-max",
+                type=float,
+                default=0.3,
+                help="Advance the horizon only if the previous-rollout truncation rate <= this.",
+            )
+            parser.add_argument(
+                "--length-curriculum-entropy-min",
+                type=float,
+                default=0.0,
+                help="Advance only if previous-rollout mean teacher entropy >= this (0 disables the entropy gate).",
+            )
+            # Opt-in: make multi-turn custom generate treat max_new_tokens as a TOTAL response
+            # budget across turns (decrement per turn) instead of a per-turn cap. OFF by default
+            # so existing scripts are unchanged; required for the length curriculum to bound length.
+            parser.add_argument(
+                "--enforce-total-response-budget",
+                action="store_true",
+                default=False,
+                help="Treat max_new_tokens as a total response budget across multi-turn generation (default per-turn).",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1562,6 +1689,30 @@ def slime_validate_args(args):
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+
+    # Validate Entropy-Aware OPD (EOPD) forward-KL term
+    if getattr(args, "use_eopd_forward_kl", False):
+        if args.context_parallel_size != 1:
+            raise ValueError(
+                "--use-eopd-forward-kl currently requires --context-parallel-size 1 "
+                "(the 2D teacher top-k tensors are not CP zigzag-sliced yet)."
+            )
+        if args.eopd_topk < 1:
+            raise ValueError("--eopd-topk must be >= 1.")
+        if args.rollout_temperature != 1.0:
+            logger.info(
+                "[EOPD] --rollout-temperature != 1: the forward-KL term compares student logits "
+                "(scaled by rollout_temperature in get_responses) against the teacher's natural "
+                "top-k log-probs. Use temperature 1 for a faithful KL."
+            )
+        # The forward-KL term needs the teacher top-k + entropy produced by the EOPD
+        # post-process; warn if it isn't wired so the term doesn't silently no-op.
+        if args.custom_reward_post_process_path is None or "eopd" not in str(args.custom_reward_post_process_path):
+            logger.info(
+                "[EOPD] --use-eopd-forward-kl is set but --custom-reward-post-process-path does not look like "
+                "the EOPD post-process (slime.rollout.on_policy_distillation.post_process_rewards_eopd). "
+                "The forward-KL term will no-op unless teacher top-k/entropy are produced."
+            )
 
     if args.megatron_to_hf_mode == "bridge":
         if (

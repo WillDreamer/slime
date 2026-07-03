@@ -27,6 +27,14 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    # Entropy-aware OPD (EOPD): per-response-token teacher top-k distribution + teacher entropy.
+    # teacher_topk_ids: [response_len, K] int token ids of the teacher's top-k at each position.
+    # teacher_topk_log_probs: [response_len, K] teacher log-probs for those ids (raw, NOT renormalized).
+    # teacher_entropy: [response_len] teacher per-token entropy (approximated from the top-k mass),
+    #                  used to gate the forward-KL term (apply forward KL only when entropy > threshold).
+    teacher_topk_ids: Any | None = None
+    teacher_topk_log_probs: Any | None = None
+    teacher_entropy: Any | None = None
 
     class Status(Enum):
         PENDING = "pending"

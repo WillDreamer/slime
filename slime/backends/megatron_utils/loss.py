@@ -387,14 +387,41 @@ def apply_opd_kl_to_advantages(
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
+    # v2: optional complementary entropy gate — restrict the reverse-KL term to LOW-entropy
+    # teacher tokens (H <= tau), the exact complement of the EOPD forward-KL high-entropy gate.
+    # tau defaults to --eopd-entropy-threshold so the two gates partition tokens cleanly.
+    use_gate = getattr(args, "use_opd_entropy_gate", False)
+    teacher_entropy = rollout_data.get("teacher_entropy") if use_gate else None
+    if use_gate and teacher_entropy is None:
+        raise ValueError(
+            "--use-opd-entropy-gate requires teacher_entropy (EOPD teacher scoring: "
+            "reward_func_eopd / post_process_rewards_eopd), but it is missing."
+        )
+    tau = getattr(args, "opd_entropy_gate_threshold", None)
+    if tau is None:
+        tau = getattr(args, "eopd_entropy_threshold", 0.0)
+
     reverse_kls = []
+    lowent_gates = []
     for i, adv in enumerate(advantages):
         reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+        if use_gate:
+            te = teacher_entropy[i]
+            # low-entropy gate (H <= tau); rl==0 edge -> teacher_entropy is None (empty tensor anyway)
+            if te is None:
+                gate = torch.ones_like(reverse_kl)
+            else:
+                gate = (te.to(device=device) <= tau).to(reverse_kl.dtype)
+            reverse_kl = reverse_kl * gate
+            lowent_gates.append(gate)
         advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 
-    # Store reverse KL for logging
+    # Store (post-gate) reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
+    if use_gate:
+        # fraction of tokens where reverse-KL is active (low-entropy) — pairs with eopd_highent_frac
+        rollout_data["opd_lowent_frac"] = lowent_gates
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -610,6 +637,144 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _student_logprobs_at_ids(
+    logits_chunk: torch.Tensor, ids: torch.Tensor, tp_group
+) -> torch.Tensor:
+    """Differentiable student log-probs at arbitrary (global) token ids, under
+    tensor-parallel vocab sharding.
+
+    ``logits_chunk`` is ``[R, V_local]`` (this rank's vocab shard); ``ids`` is
+    ``[R, K]`` global token ids. Returns ``[R, K]`` full-vocab-normalized
+    ``log pi_student(id)``, differentiable w.r.t. ``logits_chunk``.
+
+    Mirrors the vocab-parallel reductions used by the cross-entropy / entropy
+    kernels: a (detached) global max for stability, a differentiable global
+    sum-exp for the denominator, and a masked differentiable all-reduce to pick
+    out each id's logit from whichever rank owns that vocab shard. Assumes the
+    standard megatron contiguous vocab partition (rank r owns
+    ``[r * V_local, (r + 1) * V_local)``).
+    """
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    v_local = logits_chunk.size(-1)
+    vocab_start = tp_rank * v_local
+
+    # Global max over the full (sharded) vocab — detached, only for stability.
+    local_max = logits_chunk.max(dim=-1, keepdim=True).values.detach()  # [R, 1]
+    dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)
+    shifted = logits_chunk - local_max  # [R, V_local]
+
+    # Denominator: log sum_v exp(logit_v - max). Differentiable across TP.
+    local_sumexp = shifted.exp().sum(dim=-1, keepdim=True)  # [R, 1]
+    global_sumexp = dist.nn.all_reduce(local_sumexp, group=tp_group)  # SUM, differentiable
+    log_denom = global_sumexp.log()  # [R, 1]
+
+    # Pick out the requested ids: each id lives on exactly one TP rank.
+    local_ids = ids - vocab_start  # [R, K]
+    valid = (local_ids >= 0) & (local_ids < v_local)
+    local_ids_clamped = local_ids.clamp(0, v_local - 1)
+    gathered = torch.gather(shifted, 1, local_ids_clamped)  # [R, K]
+    gathered = torch.where(valid, gathered, torch.zeros_like(gathered))
+    gathered = dist.nn.all_reduce(gathered, group=tp_group)  # SUM (owner contributes), differentiable
+
+    return gathered - log_denom  # [R, K] = logit(id) - logZ = log pi_student(id)
+
+
+def compute_eopd_forward_kl(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    """Entropy-Aware OPD (EOPD) forward-KL term (arXiv:2603.07079).
+
+    On top of the reverse-KL OPD term (applied via the advantage path, see
+    ``apply_opd_kl_to_advantages``), add a forward-KL term **only on
+    high-entropy teacher tokens** — where reverse KL is unstable / collapses
+    diversity. Per response token with ``teacher_entropy > eopd_entropy_threshold``:
+
+        L_fwd = KL( p~_teacher_topk || p~_student_topk )
+              = sum_{v in topk} p~_t(v) ( log p~_t(v) - log p~_s(v) )
+
+    where ``~`` denotes renormalization over the teacher's top-k support (both
+    teacher and student). Returns ``(fkl_loss, metrics)`` or ``(None, {})`` when
+    EOPD top-k data is absent (e.g. a non-EOPD run).
+
+    Assumptions: context-parallel-size == 1 (enforced in actor.process_rollout_data)
+    and rollout_temperature == 1 (so student logits are the natural distribution,
+    matching the teacher's natural top-k log-probs — same latent assumption as the
+    reverse-KL OPD term).
+    """
+    if batch.get("teacher_topk_ids") is None:
+        return None, {}
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tau = args.eopd_entropy_threshold
+    topk_ids = batch["teacher_topk_ids"]  # list of [R, K]
+    topk_tlp = batch["teacher_topk_log_probs"]  # list of [R, K]
+    teacher_entropy = batch["teacher_entropy"]  # list of [R]
+
+    fkl_chunks: list[torch.Tensor] = []
+    gate_chunks: list[torch.Tensor] = []
+    idx = 0
+    for logits_chunk, _ in get_responses(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        max_seq_lens=batch.get("max_seq_lens", None),
+    ):
+        ids = topk_ids[idx]
+        t_lp = topk_tlp[idx]
+        ent = teacher_entropy[idx]
+        idx += 1
+        if logits_chunk.size(0) == 0:
+            continue
+
+        # student log-probs over the teacher top-k ids (full-vocab normalized).
+        s_lp = _student_logprobs_at_ids(logits_chunk.float(), ids, tp_group)  # [R, K]
+
+        # renormalize both distributions over the top-k support.
+        t_lp_renorm = t_lp - torch.logsumexp(t_lp, dim=-1, keepdim=True)
+        s_lp_renorm = s_lp - torch.logsumexp(s_lp, dim=-1, keepdim=True)
+        p_t = t_lp_renorm.exp()
+        fkl = (p_t * (t_lp_renorm - s_lp_renorm)).sum(dim=-1)  # [R]
+
+        gate = (ent > tau).float()  # [R]
+        fkl_chunks.append(fkl * gate)
+        gate_chunks.append(gate)
+
+    if not fkl_chunks:
+        return None, {}
+
+    fkl_all = torch.cat(fkl_chunks, dim=0)
+    gate_all = torch.cat(gate_chunks, dim=0)
+    fkl_loss = sum_of_sample_mean(fkl_all)
+    metrics = {
+        "eopd_forward_kl": fkl_loss.clone().detach(),
+        "eopd_highent_frac": sum_of_sample_mean(gate_all).clone().detach(),
+    }
+    return fkl_loss, metrics
+
+
+def eopd_fkl_coef_now(args: Namespace) -> float:
+    """Effective EOPD forward-KL coef for the current rollout (linear warmup).
+
+    Ramps linearly from ``--eopd-fkl-warmup-start-coef`` to ``--eopd-fkl-coef`` over the
+    first ``--eopd-fkl-warmup-rollouts`` rollouts, then holds at the target. Returns the
+    plain target coef when warmup is disabled (<=0) or the current rollout id is unknown
+    (e.g. the loss runs outside the training loop), so behavior is unchanged by default.
+    """
+    target = args.eopd_fkl_coef
+    warmup = getattr(args, "eopd_fkl_warmup_rollouts", 0) or 0
+    rollout_id = getattr(args, "current_rollout_id", None)
+    if warmup <= 0 or rollout_id is None:
+        return target
+    start = getattr(args, "eopd_fkl_warmup_start_coef", 0.0)
+    frac = min(1.0, max(0.0, rollout_id / warmup))
+    return start + (target - start) * frac
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -788,6 +953,19 @@ def policy_loss_function(
 
         loss = loss + args.kl_loss_coef * kl_loss
 
+    # EOPD: entropy-gated forward-KL distillation term (additive, differentiable
+    # through the current logits). Reverse-KL OPD still enters via the advantage.
+    eopd_metrics: dict[str, torch.Tensor] = {}
+    if getattr(args, "use_eopd_forward_kl", False):
+        eopd_fkl_loss, eopd_metrics = compute_eopd_forward_kl(args, batch, logits, sum_of_sample_mean)
+        if eopd_fkl_loss is not None:
+            eopd_fkl_coef = eopd_fkl_coef_now(args)
+            loss = loss + eopd_fkl_coef * eopd_fkl_loss
+            # log the (possibly warmed-up) effective coef so the ramp is visible in wandb.
+            eopd_metrics["eopd_fkl_coef"] = torch.as_tensor(
+                eopd_fkl_coef, device=eopd_fkl_loss.device, dtype=torch.float32
+            )
+
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
@@ -827,6 +1005,14 @@ def policy_loss_function(
     if "opd_reverse_kl" in batch:
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+    # v2: reverse-KL entropy-gate coverage (fraction of low-entropy tokens where reverse-KL fires)
+    if "opd_lowent_frac" in batch:
+        opd_lowent_frac = torch.cat(batch["opd_lowent_frac"], dim=0)
+        reported_loss["opd_lowent_frac"] = sum_of_sample_mean(opd_lowent_frac).clone().detach()
+
+    # Add EOPD forward-KL metrics if available
+    for metric_key, metric_value in eopd_metrics.items():
+        reported_loss[metric_key] = metric_value
 
     return loss, reported_loss
 

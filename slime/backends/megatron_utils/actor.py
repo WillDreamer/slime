@@ -271,6 +271,26 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
             ]
+        # EOPD forward-KL tensors: per-token teacher top-k ids/log-probs ([R, K]) and
+        # entropy ([R]). These align with the response tokens. Context parallelism
+        # would require zigzag-slicing the 2D top-k tensors along the token dim, which
+        # is not implemented yet, so the EOPD forward-KL path requires CP == 1.
+        if "teacher_topk_ids" in rollout_data:
+            assert (
+                mpu.get_context_parallel_world_size() == 1
+            ), "EOPD forward-KL term currently requires context-parallel-size == 1."
+            rollout_data["teacher_topk_ids"] = [
+                t.to(device=torch.cuda.current_device(), dtype=torch.long) for t in rollout_data["teacher_topk_ids"]
+            ]
+            rollout_data["teacher_topk_log_probs"] = [
+                t.to(device=torch.cuda.current_device(), dtype=torch.float32)
+                for t in rollout_data["teacher_topk_log_probs"]
+            ]
+            rollout_data["teacher_entropy"] = [
+                t.to(device=torch.cuda.current_device(), dtype=torch.float32)
+                for t in rollout_data["teacher_entropy"]
+            ]
+
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
