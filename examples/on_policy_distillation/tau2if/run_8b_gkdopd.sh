@@ -54,7 +54,7 @@ cd "${ROOT_DIR}/slime"   # train.py / tools / examples paths resolve from the sl
 # ----------------------------------------------------------------------------
 # GPU allocation
 # ----------------------------------------------------------------------------
-# GPU 0 is free: the user simulator is remote (131.179.168.120:8098), nothing launched locally.
+# GPU 0 is free: the user simulator is remote (131.179.168.120:8000), nothing launched locally.
 TEACHER_GPU=1                   # <<<--- teacher SGLang server
 TRAIN_GPU_LIST=(2 3 4 5 6 7)    # <<<--- training (Ray, colocate)
 NUM_GPUS=${#TRAIN_GPU_LIST[@]}
@@ -78,7 +78,7 @@ BASE_HF=${MODEL_ROOT}/Qwen3-8B-Base/                       # tokenizer + config
 export PYTHONPATH="${ROOT_DIR}/slime/examples/tau-bench:${SCRIPT_DIR}:${ROOT_DIR}/slime:${ROOT_DIR}/Megatron-LM:${PYTHONPATH}"
 
 # Remote tau-bench user simulator (OpenAI-compatible). Read by tau_bench during rollout.
-export OPENAI_API_BASE=http://131.179.168.120:8098/v1
+export OPENAI_API_BASE=http://131.179.168.120:8000/v1
 export OPENAI_API_KEY=dummy
 
 # ----------------------------------------------------------------------------
@@ -96,14 +96,14 @@ if [ ! -d "${TEACHER_HF}" ]; then
 fi
 
 # ----------------------------------------------------------------------------
-# 1) Remote user simulator (tau-bench user-sim LLM @ 131.179.168.120:8098).
+# 1) Remote user simulator (tau-bench user-sim LLM @ 131.179.168.120:8000).
 # ----------------------------------------------------------------------------
-USERSIM_URL=http://131.179.168.120:8098/v1/models
+USERSIM_URL=http://131.179.168.120:8000/v1/models
 if curl -sf -m 10 "${USERSIM_URL}" >/dev/null 2>&1; then
     echo "Remote user simulator reachable at ${USERSIM_URL}."
 else
     echo "ERROR: remote user simulator NOT reachable at ${USERSIM_URL}." >&2
-    echo "       Make sure the tau-bench user-sim server on 131.179.168.120:8098 is up and network-reachable." >&2
+    echo "       Make sure the tau-bench user-sim server on 131.179.168.120:8000 is up and network-reachable." >&2
     exit 1
 fi
 
@@ -173,7 +173,12 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1            # forward-KL assumes natural (temp=1) student logits
    --global-batch-size 192            # 192 trajectories -> 1 grad step/rollout; 192/DP(3) = 64
    --balance-data
-   # (no dynamic-sampling-filter / chat-template / label-key -- see run_8b_opd.sh.)
+   # Drop prompt-groups with an ABORTED sample so they never hit the teacher post-process with a
+   # None reward (the crash that killed eopd_tau2if @ rollout 69 during a user-sim outage).
+   # Status-based, composes with pure OPD's constant-0 reward; slime regenerates dropped groups.
+   # See opd_filters.py.
+   --dynamic-sampling-filter-path opd_filters.drop_group_with_aborted
+   # (no --apply-chat-template / --label-key: tau prompts are task indices, templated in-env.)
 
    # Save per-rollout trajectories for offline analysis (length/turns/trunc, raw tokens).
    --save-debug-rollout-data "${ROLLOUT_DEBUG_DIR}/rollout_{rollout_id}.pt"
