@@ -6,17 +6,24 @@ OPD KL penalty applied in slime/backends/megatron_utils/loss.py:
     advantage -= opd_kl_coef * (student_log_prob - teacher_log_prob)   # per token
 
 Each student rollout is scored by the teacher that OWNS its domain (domain-routing,
-*not* averaging) — a Search teacher gives meaningless logprobs on a Tau trajectory
-and vice versa:
+*not* averaging) — a Math teacher gives meaningless logprobs on a Tau trajectory,
+a Search teacher on a Math trajectory, etc. The three teachers are the specialists
+from the math2sea / sea2tau / tau2if experiments:
 
-    sample.metadata["domain"] == "search"  ->  Search teacher server
-    sample.metadata["domain"] == "tau"     ->  Tau    teacher server
+    sample.metadata["domain"] == "math"    ->  Math   teacher  (Qwen3-8B-Base-Math)
+    sample.metadata["domain"] == "search"  ->  Search teacher  (Qwen3-8B-Base-Math-SeaSFT-Search)
+    sample.metadata["domain"] == "tau"     ->  Tau    teacher  (Qwen3-8B-Base-Math-SeaSFT-Search-TauSFT-Tau)
+
+Distilling all three back into ONE student (the end-of-chain
+Qwen3-8B-Base-Math-SeaSFT-Search-TauSFT-Tau-IF, which has drifted from every earlier
+specialty) recovers math + search + tau simultaneously.
 
 Teacher endpoints are read from the environment (the teacher SGLang servers live on
-remote nodes; the script stays config-free):
+remote nodes / spare GPUs; the script stays config-free):
 
-    OPD_TEACHER_URL_SEARCH   e.g. http://node-a:13141/generate
-    OPD_TEACHER_URL_TAU      e.g. http://node-b:13142/generate
+    OPD_TEACHER_URL_MATH     e.g. http://node-a:13140/generate
+    OPD_TEACHER_URL_SEARCH   e.g. http://node-b:13141/generate
+    OPD_TEACHER_URL_TAU      e.g. http://node-c:13142/generate
 
 This mirrors slime/rollout/on_policy_distillation.py (the single-teacher example);
 the only addition is per-sample teacher selection.
@@ -29,8 +36,9 @@ import torch
 
 from slime.utils.types import Sample
 
-# domain -> teacher /generate endpoint (remote nodes)
+# domain -> teacher /generate endpoint (remote nodes / spare GPUs)
 TEACHER_URLS = {
+    "math": os.environ["OPD_TEACHER_URL_MATH"],
     "search": os.environ["OPD_TEACHER_URL_SEARCH"],
     "tau": os.environ["OPD_TEACHER_URL_TAU"],
 }
